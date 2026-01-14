@@ -1,0 +1,21 @@
+正在crowdai数据集上跑40epoch（带consistency）
+不加Stride=4伪特征图和匈牙利动态角点标签的版本
+
+解除注释main中的411开始的代码，然后续接断点开始训练
+GEO-DETR文件夹中：
+CUDA_VISIBLE_DEVICES=1 python main.py         
+    --coco_path /home/zfx/datasets/CrowdAI         
+    --output_dir ./train_crowdai          
+    --resume "/home/zfx/GEO-DETR/train_crowdai/checkpoint.pth"          
+    --dataset_file coco       
+    --epochs 40      
+    --lr 2e-4       
+    --lr_backbone 2e-5     
+    --lr_drop 30       
+    --batch_size 8       
+    --num_queries 300       
+    --num_feature_levels 4   
+    --with_box_refine             
+    --poly_coord_loss_coef 5.0             
+    --poly_corner_loss_coef 0.2             
+    --num_workers 8

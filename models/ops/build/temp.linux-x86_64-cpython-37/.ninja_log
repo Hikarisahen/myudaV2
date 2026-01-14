@@ -1,0 +1,4 @@
+# ninja log v5
+0	5535	1766112762770818933	/home/zfx/Deformable-DETR/models/ops/build/temp.linux-x86_64-cpython-37/home/zfx/Deformable-DETR/models/ops/src/cpu/ms_deform_attn_cpu.o	6e874ec05295040a
+0	15268	1766112772506820104	/home/zfx/Deformable-DETR/models/ops/build/temp.linux-x86_64-cpython-37/home/zfx/Deformable-DETR/models/ops/src/cuda/ms_deform_attn_cuda.o	e9333582316449fa
+0	20961	1766112778174821033	/home/zfx/Deformable-DETR/models/ops/build/temp.linux-x86_64-cpython-37/home/zfx/Deformable-DETR/models/ops/src/vision.o	b711ab7b6702b389
