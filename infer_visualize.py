@@ -50,9 +50,25 @@ def collect_images(image_path=None, image_dir=None):
     return paths
 
 
+def get_poly_cosines(poly):
+    """
+    计算每个顶点的余弦值 (用于判断是否锐角)
+    poly: (N, 2)
+    """
+    diff_prev = poly - np.roll(poly, 1, axis=0)
+    diff_next = np.roll(poly, -1, axis=0) - poly
+    norm_prev = np.linalg.norm(diff_prev, axis=1, keepdims=True) + 1e-6
+    norm_next = np.linalg.norm(diff_next, axis=1, keepdims=True) + 1e-6
+    
+    vec_prev = diff_prev / norm_prev
+    vec_next = diff_next / norm_next
+    
+    return np.sum(vec_prev * vec_next, axis=1)
+
+
 def apply_nms(poly, corner_scores, corner_thresh, dist_thresh):
     """
-    对单张多边形的角点进行 NMS
+    对单张多边形的角点进行 NMS (支持动态抑制策略)
     poly: (N, 2) 绝对坐标
     corner_scores: (N,) 角点得分
     corner_thresh: 得分阈值
@@ -61,6 +77,13 @@ def apply_nms(poly, corner_scores, corner_thresh, dist_thresh):
     candidate_idxs = np.where(corner_scores > corner_thresh)[0]
     if len(candidate_idxs) == 0:
         return np.zeros_like(corner_scores, dtype=bool)
+
+    # 1. 计算每个点的几何锐度
+    # cos值越小越尖 (1:直线, 0:直角, -1:折返)
+    # 设定 "锐角" 阈值 (例如 45度 -> cos ~ 0.7)
+    cosines = get_poly_cosines(poly)
+    sharp_mask = cosines < 0.75  # 简单的启发式阈值
+    min_dist_for_short_edge = 3.0 # 如果两个点都是锐角，允许的最小距离 (3像素)
 
     # 按得分降序排列
     sorted_indices = candidate_idxs[np.argsort(corner_scores[candidate_idxs])[::-1]]
@@ -73,11 +96,23 @@ def apply_nms(poly, corner_scores, corner_thresh, dist_thresh):
             continue
         
         # 计算与已保留点的距离
-        kept_coords = poly[keep_indices]
+        kept_idxs_arr = np.array(keep_indices)
+        kept_coords = poly[kept_idxs_arr]
         dists = np.linalg.norm(kept_coords - curr_coord, axis=1)
         
-        # 如果所有距离都大于阈值，则保留
-        if np.all(dists > dist_thresh):
+        # --- [动态 NMS 核心逻辑] ---
+        # 默认阈值
+        thresholds = np.full_like(dists, dist_thresh)
+        
+        # 如果当前点是锐角，且被比较的点也是锐角 -> 这是一个短边结构 -> 使用极小阈值
+        if sharp_mask[idx]:
+            # 找到那些也是锐角的已保留点
+            is_kept_sharp = sharp_mask[kept_idxs_arr]
+            # 对这些点，将抑制阈值降低 (允许共存)
+            thresholds[is_kept_sharp] = min_dist_for_short_edge
+            
+        # 只要与任何一个保留点的距离小于对应的阈值，就被抑制
+        if np.all(dists > thresholds):
             keep_indices.append(idx)
             
     mask = np.zeros_like(corner_scores, dtype=bool)
