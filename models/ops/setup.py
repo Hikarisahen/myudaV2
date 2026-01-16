@@ -7,7 +7,7 @@
 # ------------------------------------------------------------------------------------------------
 
 import os
-os.environ["CUDA_HOME"] = "/usr/local/cuda-11.7" # 确保这里指向你真实的 cuda 路径
+os.environ["CUDA_HOME"] = "/usr/local/cuda-12.8" # 确保这里指向你真实的 cuda 路径
 
 import glob
 

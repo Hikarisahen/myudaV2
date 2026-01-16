@@ -3,3 +3,4 @@ __pycache__/
 train_crowdai
 weights
 vis_out
+weight/checkpoint_crowd.pth
