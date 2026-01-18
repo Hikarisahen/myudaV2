@@ -108,7 +108,7 @@ def _get_clones(module, N):
 class DeformableDETR(nn.Module):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False):
+                 aux_loss=True, with_box_refine=False, two_stage=False, use_mae=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -124,6 +124,20 @@ class DeformableDETR(nn.Module):
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
+        # [新增] 初始化 MAE Decoder
+        self.use_mae = use_mae
+        if self.use_mae:
+            # feature_size 取决于你的 Backbone 和输入图像尺寸
+            # 这里的 (10, 10) 是基于 input size (320x320) / 32 的估算值
+            # feature_size是backbone最后一层特征图的尺寸
+            # 可以改成自适应，或者作为超参传入
+            self.mae_decoder = AuxiliaryMAEDecoder(
+                d_model=transformer.d_model, 
+                feature_size=(10, 10) # 这里稍微给大一点或者根据实际情况调整
+            )
+            # 这里的 Feature Size 其实不影响 query_embed 的大小，只要足够覆盖最大特征图即可
+            # 或者为了严谨，我们可以在 forward 里动态生成 query_embed (如果支持变长)
+            # 但为了遵循 MRT 论文，使用固定 Query 也是可以的
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
 
@@ -232,7 +246,7 @@ class DeformableDETR(nn.Module):
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
-    def forward(self, samples: NestedTensor):
+    def forward(self, samples: NestedTensor, mask_ratio: float = 0.0):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -271,6 +285,85 @@ class DeformableDETR(nn.Module):
                 srcs.append(src)
                 masks.append(mask)
                 pos.append(pos_l)
+
+        # ================== [新增] MAE 分支逻辑 ==================
+        mae_outputs = None
+        if self.use_mae and mask_ratio > 0.0:
+            # 1. 选取最后一层特征图进行 Mask (srcs[-1])
+            # 根据 MRT 论文，只重建最高层语义特征
+            src_to_mask = srcs[-1] # (B, C, H, W)
+            B, C, H, W = src_to_mask.shape
+            
+            # 2. 生成随机 Mask
+            # 展平为 (B, HW)
+            num_tokens = H * W
+            num_masked = int(mask_ratio * num_tokens)
+            
+            # 生成随机索引
+            # rand_indices: (B, HW)
+            rand_indices = torch.rand(B, num_tokens, device=src_to_mask.device).argsort(dim=1)
+            mask_indices = rand_indices[:, :num_masked] # 要被 Mask 掉的索引
+            keep_indices = rand_indices[:, num_masked:] # 保留的索引
+            
+            # 创建 Mask 矩阵 (B, H, W)
+            # mask_token 应该是一个可学习的向量，或者直接填 0
+            # 这里简单起见填 0
+            src_masked = src_to_mask.flatten(2).clone() # (B, C, HW)
+            
+            # 将被 mask 的位置置为 0
+            # 为了批量操作，我们可以利用 scatter 或者索引
+            # 这里简单循环 B (效率稍低但逻辑清晰)
+            binary_mask = torch.zeros(B, num_tokens, device=src_to_mask.device)
+            for i in range(B):
+                src_masked[i, :, mask_indices[i]] = 0
+                binary_mask[i, mask_indices[i]] = 1 # 记录 mask 位置用于计算 Loss
+            
+            src_masked = src_masked.view(B, C, H, W)
+            
+            # 3. 将 Mask 后的特征送入 Transformer Encoder
+            # 注意：这里我们需要仅仅跑 Encoder，而原始的 self.transformer() 是一次性跑完 Encoder+Decoder
+            # 因此，我们可能需要修改 DeformableTransformer 类，或者在这里手动调用 encoder
+            # 假设 transformer 有 .encoder 属性
+            
+            # 构造 encoder 输入
+            # 仅对最后一层做 mask，其他层保持原样输入给 encoder 用于提供 context (MRT论文思路)
+            srcs_for_enc = srcs[:-1] + [src_masked]
+            
+            # 调用 encoder (需要确保你的 transformer 暴露了 get_encoder_output 接口)
+            # 或者标准 DeformableDETR transformer 调用方式:
+            # memory = self.transformer.encoder(srcs, masks, pos_embeds)
+            # 这里我们假设 self.transformer 内部拆分了 encoder/decoder，或者我们直接修改 transformer.forward
+            
+            # 暂时假设 self.transformer.encoder 可以独立调用
+            # 如果没有，你需要去修改 deformable_transformer.py
+            memory = self.transformer.forward_encoder(srcs_for_enc, masks, pos)
+            
+            # 4. 取出最后一层的 Encoder Output 对应的部分
+            # Encoder 输出的是多尺度特征展平后的序列
+            # 我们需要切片出最后一层特征
+            # memory: (B, Sum(H_l * W_l), C)
+            spatial_shapes = torch.as_tensor([s.shape[-2:] for s in srcs], device=src_to_mask.device)
+            level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1]))
+            
+            last_lvl_start = level_start_index[-1]
+            encoded_last_lvl = memory[:, last_lvl_start:, :] # (B, HW, C)
+            
+            # 5. 送入 MAE Decoder 进行重构
+            rec_features = self.mae_decoder(encoded_last_lvl, align_h=H, align_w=W) # (HW, B, C)
+            rec_features = rec_features.permute(1, 0, 2) # (B, HW, C)
+            
+            # 6. 计算 MAE Loss (只在此时计算并返回，不影响主流程)
+            # 目标是原始特征图 src_to_mask (未经 Proj 或 经 Proj 均可，建议经 Proj)
+            target_features = src_to_mask.flatten(2).permute(0, 2, 1) # (B, HW, C)
+            
+            loss_mae = F.mse_loss(rec_features, target_features, reduction='none')
+            loss_mae = (loss_mae.mean(dim=-1) * binary_mask).sum() / (binary_mask.sum() + 1e-6)
+            
+            mae_outputs = {'loss_mae': loss_mae}
+            
+            # 如果只是为了跑 MAE 预热，可以直接 return mae_outputs
+            # return mae_outputs 
+        # =========================================================
 
         query_embeds = None
         if not self.two_stage:
@@ -415,6 +508,10 @@ class DeformableDETR(nn.Module):
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
             out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
+        
+        if mae_outputs is not None:
+            out.update(mae_outputs)
+
         return out
 
     @torch.jit.unused
@@ -1118,6 +1215,7 @@ def build(args):
         aux_loss=args.aux_loss,
         with_box_refine=args.with_box_refine,
         two_stage=args.two_stage,
+        use_mae=args.use_mae
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
@@ -1168,3 +1266,62 @@ def build(args):
             postprocessors["panoptic"] = PostProcessPanoptic(is_thing_map, threshold=0.85)
 
     return model, criterion, postprocessors
+
+
+class AuxiliaryMAEDecoder(nn.Module):
+    """
+    轻量级 MAE Decoder，用于从被 Mask 的 Encoder 特征中重构原始特征。
+    参考论文 MRT 附录 Table 2 的参数设置。
+    """
+    def __init__(self, d_model=256, nhead=8, num_layers=2, feature_size=(21, 42)):
+        super().__init__()
+        # 这里的 feature_size 是最后一层特征图的大小
+        # 假设输入图像 666x1333 -> ResNet下采样32倍 -> 约 21x42 (882个Queries)
+        self.feature_size = feature_size
+        self.num_queries = feature_size[0] * feature_size[1]
+        
+        decoder_layer = nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward=1024, dropout=0.1)
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers)
+        
+        # 固定位置的 Queries，代表特征图上的每个 Grid
+        self.query_embed = nn.Embedding(self.num_queries, d_model)
+        
+        # 输出投影层，还原到 d_model 维度
+        self.output_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x_masked, align_h=None, align_w=None):
+        # x_masked: (B, SeqLen_Enc, C)
+        bs = x_masked.shape[0]
+        
+        # 1. 准备 tgt (Queries)
+        # 原始定义的固定尺寸 (10, 10)
+        h_ref, w_ref = self.feature_size
+        
+        # 将 Query Embed (100, 256) 还原为 2D 空间 (1, 256, 10, 10)
+        # 注意 query_embed 是 (Num_Queries, C)，我们需要 permute
+        query_embed = self.query_embed.weight.permute(1, 0).view(1, -1, h_ref, w_ref)
+        
+        # === [关键修复] 动态插值 ===
+        # 如果当前特征图尺寸 (align_h, align_w) 与预设不一致，则强制插值对齐
+        if align_h is not None and (align_h != h_ref or align_w != w_ref):
+            query_embed = F.interpolate(
+                query_embed, 
+                size=(align_h, align_w), 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
+        # 展平回序列: (1, 256, H_new, W_new) -> (1, 256, SeqLen_New) -> (SeqLen_New, 1, 256)
+        tgt = query_embed.flatten(2).permute(2, 0, 1).repeat(1, bs, 1)
+        
+        # 2. 准备 memory (x_masked)
+        if x_masked.dim() == 4:
+            x_masked = x_masked.flatten(2).permute(2, 0, 1)
+        elif x_masked.dim() == 3 and x_masked.shape[1] != bs: 
+             x_masked = x_masked.permute(1, 0, 2)
+
+        # 3. Transformer 解码
+        output = self.decoder(tgt, x_masked)
+        
+        # 4. 投影回特征空间
+        return self.output_proj(output)

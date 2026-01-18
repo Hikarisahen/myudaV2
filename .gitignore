@@ -4,3 +4,5 @@ train_crowdai
 weights
 vis_out
 weight/checkpoint_crowd.pth
+uda_jilin_run_v1
+uda_jilin_run_v2
