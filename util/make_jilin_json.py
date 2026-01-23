@@ -69,4 +69,7 @@ def generate_json():
     print("✅ 成功！索引文件已生成。")
 
 if __name__ == "__main__":
+    """
+    用于为目标文件夹的图像生成 COCO 格式的 JSON 索引文件。不含标注。
+    """
     generate_json()

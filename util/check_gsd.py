@@ -46,7 +46,7 @@ def get_gsd(image_path):
 if __name__ == "__main__":
     # 在这里替换成你的图片路径
     # 1. 检查吉林一号大图 (通常是 .tif)
-    jilin_path = "/data/zfx/datasets/tile_0.TIF"
+    jilin_path = "/data/zfx/datasets/Jilin-1/tile_0.TIF"
     
     # 2. 检查 CrowdAI 小图 (如果是 jpg，通常读不到，需要查文档)
     crowdai_path = "/data/zfx/datasets/CrowdAI/train/images/000000000042.jpg"

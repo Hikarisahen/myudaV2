@@ -218,10 +218,11 @@ def main():
     # 避免与 get_args_parser 里的 --output_dir 冲突，改名为 vis_output_dir
     parser.add_argument("--vis_output_dir", default="./vis_out", help="Directory to save visualizations")
     parser.add_argument("--score_thresh", type=float, default=0.5, help="Object score threshold")
-    parser.add_argument("--corner_thresh", type=float, default=0.5, help="Corner score threshold")
+    parser.add_argument("--corner_thresh", type=float, default=0.45, help="Corner score threshold")
     parser.add_argument("--onlycorner", action="store_true", help="Only draw polygon formed by corner points")
     parser.add_argument("--enable_nms", action="store_true", help="Enable NMS for corner points")
     parser.add_argument("--nms_thresh", type=float, default=10.0, help="NMS distance threshold in pixels")
+
 
     args = parser.parse_args()
 
@@ -269,4 +270,6 @@ if __name__ == "__main__":
         --checkpoint "/home/data/zfx/DETR/SL1andfocal_train/checkpoint.pth" \
         --image_dir /home/zfx/datasets/WHU/test \
         --vis_output_dir /home/data/zfx/DETR/SL1andfocal_train/vis_out
+
+    python infer_visualize.py   --checkpoint weight/checkpoint_crowd.pth   --image_dir /data/zfx/datasets/CrowdAI/test_images/    --vis_output_dir ./vis_out/origincrowd4   --with_box_refine    --num_queries 300  --num_feature_levels 4    --dataset_file coco   --score_thresh 0.5    --corner_thresh 0.45    --onlycorner  --enable_nms --source_path "" --target_path ""
     """

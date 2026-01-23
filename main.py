@@ -43,11 +43,16 @@ import matplotlib.pyplot as plt
 
 # 固定可视化使用的图片路径
 CUSTOM_VIS_IMAGE_PATHS = [
-    # 这里建议替换为吉林一号（目标域）的图片路径，用于观察适应效果
+    # # 为吉林一号（目标域）的图片路径，用于观察适应效果
+    # "/data/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
+    # "/data/zfx/datasets/Jilin-1/train/images/tile_0_crop_49_64.jpg",
+    # "/data/zfx/datasets/Jilin-1/train/images/tile_0_crop_68_82.jpg",
+    # "/data/zfx/datasets/Jilin-1/train/images/tile_0_crop_79_5.jpg",
+    # WHU
     "/data/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
-    "/data/zfx/datasets/Jilin-1/train/images/tile_0_crop_49_64.jpg",
-    "/data/zfx/datasets/Jilin-1/train/images/tile_0_crop_68_82.jpg",
-    "/data/zfx/datasets/Jilin-1/train/images/tile_0_crop_79_5.jpg",
+    "/data/zfx/datasets/WHUuda/train/images/3001001_crop_0_1.jpg",  # 建筑物
+    "/data/zfx/datasets/WHUuda/train/images/3001007_crop_3_2.jpg",  # 道路负样本
+    "/data/zfx/datasets/WHUuda/train/images/300490_crop_0_2.jpg",  # 简单建筑物
 ]
 
 def get_args_parser():
@@ -60,6 +65,9 @@ def get_args_parser():
     parser.add_argument('--lambda_unsup', default=1.0, type=float, help="Weight for unsupervised loss")
     parser.add_argument('--lambda_mae', default=1.0, type=float, help="Weight for MAE reconstruction loss")
     parser.add_argument('--mask_ratio', default=0.75, type=float, help="Mask ratio for MAE")
+    parser.add_argument('--pseudo_corner_thresh', default=0.45, type=float, help="教师伪标签角点分数阈值")
+    parser.add_argument('--pseudo_corner_nms_thresh', default=10.0, type=float, help="教师伪标签角点NMS距离阈值（像素）")
+    parser.add_argument('--disable_pseudo_corner_nms', action='store_true', help="构建教师伪标签时禁用角点NMS")
     # ====================
 
     parser.add_argument('--lr', default=2e-4, type=float)
@@ -493,7 +501,7 @@ def main(args):
 
         # Eval (使用 Teacher 模型评估，通常 Teacher 泛化更好)
         test_stats = {}
-        if (epoch + 1) % 5 == 0 or (epoch + 1) == args.epochs:
+        if (epoch + 1) % 20 == 0 or (epoch + 1) == args.epochs:
             print(f"Evaluating Teacher Model at epoch {epoch}...")
             test_stats, coco_evaluator = evaluate(
                 teacher_model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir

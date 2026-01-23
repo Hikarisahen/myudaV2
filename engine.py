@@ -16,12 +16,14 @@ import sys
 from typing import Iterable
 import copy
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
 from datasets.data_prefetcher import data_prefetcher
+from preprocess_annotation import uniform_sampling_vectorized
 
 # =============================================================================
 # Helper Class 1: Dynamic Threshold (MRT Paper Appendix Section 2)
@@ -31,9 +33,10 @@ class DynamicThreshold:
     动态调整伪标签筛选阈值 。
     阈值 = gamma * 旧阈值 + (1-gamma) * (源域平均置信度)
     """
-    def __init__(self, num_classes, initial_threshold=0.3, max_threshold=0.5, gamma=0.9):
-        # 初始阈值设为 0.3，上限 0.5 (参考 MRT 附录 Table 2)
+    def __init__(self, num_classes, min_threshold=0.3, initial_threshold=0.45, max_threshold=0.55, gamma=0.9):
+        # 初始阈值设为 0.4，上限 0.5 (参考 MRT 附录 Table 2修改)
         self.thresholds = torch.full((num_classes,), initial_threshold).cuda()
+        self.min_threshold = min_threshold
         self.max_threshold = max_threshold
         self.gamma = gamma
 
@@ -74,6 +77,7 @@ class DynamicThreshold:
                     # EMA 更新 (纯 Scalar 运算)
                     current_thr = self.thresholds[c].item()
                     new_thr = self.gamma * current_thr + (1 - self.gamma) * avg_score
+                    new_thr = max(new_thr, self.min_threshold)
                     new_thr = min(new_thr, self.max_threshold)
                     
                     # 原地赋值 (Scalar -> Tensor Element)
@@ -127,11 +131,122 @@ def FDA_source_to_target(src_img, tgt_img, beta=0.01):
 
         return src_in_tgt_style
 
+
+# =============================================================================
+# Helper Function 4: Corner Filtering + Uniform Sampling (Teacher Pseudo Labels)
+# =============================================================================
+def get_poly_cosines(poly: np.ndarray) -> np.ndarray:
+    """
+    Compute cosine of each interior angle for a polygon (N, 2).
+    Used to identify sharp corners during NMS.
+    """
+    diff_prev = poly - np.roll(poly, 1, axis=0)
+    diff_next = np.roll(poly, -1, axis=0) - poly
+    norm_prev = np.linalg.norm(diff_prev, axis=1, keepdims=True) + 1e-6
+    norm_next = np.linalg.norm(diff_next, axis=1, keepdims=True) + 1e-6
+
+    vec_prev = diff_prev / norm_prev
+    vec_next = diff_next / norm_next
+
+    return np.sum(vec_prev * vec_next, axis=1)
+
+
+def apply_corner_nms(poly: np.ndarray, corner_scores: np.ndarray, corner_thresh: float, dist_thresh: float) -> np.ndarray:
+    """
+    Corner-level NMS identical to infer_visualize.py, but pure numpy for training loop.
+    Returns a boolean mask of kept corners.
+    """
+    candidate_idxs = np.where(corner_scores > corner_thresh)[0]
+    if len(candidate_idxs) == 0:
+        return np.zeros_like(corner_scores, dtype=bool)
+
+    cosines = get_poly_cosines(poly)
+    sharp_mask = cosines < 0.75
+    min_dist_for_short_edge = 3.0
+
+    sorted_indices = candidate_idxs[np.argsort(corner_scores[candidate_idxs])[::-1]]
+
+    keep_indices = []
+    for idx in sorted_indices:
+        curr_coord = poly[idx]
+        if not keep_indices:
+            keep_indices.append(idx)
+            continue
+
+        kept_idxs_arr = np.array(keep_indices)
+        kept_coords = poly[kept_idxs_arr]
+        dists = np.linalg.norm(kept_coords - curr_coord, axis=1)
+
+        thresholds = np.full_like(dists, dist_thresh)
+        if sharp_mask[idx]:
+            is_kept_sharp = sharp_mask[kept_idxs_arr]
+            thresholds[is_kept_sharp] = min_dist_for_short_edge
+
+        if np.all(dists > thresholds):
+            keep_indices.append(idx)
+
+    mask = np.zeros_like(corner_scores, dtype=bool)
+    mask[keep_indices] = True
+    return mask
+
+
+def _get_valid_hw_from_mask(mask: torch.Tensor):
+    """Derive valid (h, w) from NestedTensor mask (True = padding)."""
+    valid_rows = (~mask).any(dim=1)
+    valid_cols = (~mask).any(dim=0)
+    h = int(valid_rows.sum().item())
+    w = int(valid_cols.sum().item())
+    return h, w
+
+
+def process_polygon_with_corners(poly_norm: torch.Tensor, corner_scores: torch.Tensor, img_h: int, img_w: int,
+                                 corner_thresh: float, nms_thresh: float, enable_nms: bool, num_corners: int = 64):
+    """
+    1) 将归一化多边形转换到像素坐标
+    2) 依据角点分数筛选/去重角点
+    3) 使用 preprocess_annotation 中的均匀采样逻辑插值到固定点数
+    返回归一化后的采样点与角点标签 (shape: [num_corners, 2], [num_corners]).
+    """
+    if img_h <= 0 or img_w <= 0:
+        return None, None
+
+    poly_np = poly_norm.detach().cpu().numpy().copy()
+    poly_np[:, 0] *= img_w
+    poly_np[:, 1] *= img_h
+
+    scores_np = None if corner_scores is None else corner_scores.detach().cpu().numpy()
+
+    if scores_np is None:
+        corner_mask = np.ones(poly_np.shape[0], dtype=bool)
+    else:
+        if enable_nms:
+            corner_mask = apply_corner_nms(poly_np, scores_np, corner_thresh, nms_thresh)
+        else:
+            corner_mask = scores_np > corner_thresh
+
+        if corner_mask.sum() < 3:
+            corner_mask = scores_np > corner_thresh
+
+    if corner_mask.sum() < 3:
+        corner_mask = np.ones(poly_np.shape[0], dtype=bool)
+
+    poly_for_sampling = poly_np[corner_mask]
+    sampled_flat, corner_label = uniform_sampling_vectorized(poly_for_sampling.flatten(), num_corners)
+    if sampled_flat is None:
+        return None, None
+
+    sampled_pts = torch.as_tensor(sampled_flat, dtype=torch.float32, device=poly_norm.device).reshape(num_corners, 2)
+    sampled_pts[:, 0] /= float(img_w)
+    sampled_pts[:, 1] /= float(img_h)
+    sampled_corner_label = torch.as_tensor(corner_label, dtype=torch.float32, device=poly_norm.device)
+
+    return sampled_pts, sampled_corner_label
+
 # =============================================================================
 # Helper Function 3: EMA Update
 # =============================================================================
 @torch.no_grad()
-def update_teacher(student_model, teacher_model, alpha=0.999):
+def update_teacher(student_model, teacher_model, alpha=0.9996):
     """
     Mean Teacher 更新逻辑: Teacher = alpha * Teacher + (1-alpha) * Student
     [cite: 108, 109]
@@ -181,8 +296,9 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
             break
 
         # === 动态权重 ===
-        # 前 5 epoch 不加 unsup loss，让 student 先学好 source
-        lambda_unsup = args.lambda_unsup * min(1.0, max(0.0, epoch - 5) / 5.0)
+        # 前 10 epoch 不加 unsup loss，让 student 先学好 source
+        burn_in_epochs = 10
+        lambda_unsup = args.lambda_unsup * min(1.0, max(0.0, epoch - burn_in_epochs) / 5.0)
         # MAE 权重随时间衰减
         lambda_mae = args.lambda_mae * (1.0 - epoch / args.epochs)
 
@@ -193,51 +309,89 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
         src_imgs_stylized = FDA_source_to_target(src_imgs, tgt_imgs, beta=0.09)
         src_samples_stylized = utils.NestedTensor(src_imgs_stylized, src_samples.mask)
 
-        # 2. Teacher Generate Pseudo Labels
+        # 2. Teacher Generate Pseudo Labels (corner processing + 64-point interpolation)
         pseudo_targets = []
+        corner_thresh = getattr(args, 'pseudo_corner_thresh', 0.45)
+        corner_nms_thresh = getattr(args, 'pseudo_corner_nms_thresh', 10.0)
+        enable_corner_nms = not getattr(args, 'disable_pseudo_corner_nms', False)
         with torch.no_grad():
             teacher_output = teacher(tgt_samples)
             # 优先使用 Evolve_1 (精度最高)
             teacher_polys = teacher_output.get('pred_polys_evolve_1', teacher_output['pred_polys_init'])
             teacher_logits = teacher_output['pred_logits']
             teacher_boxes = teacher_output['pred_boxes']
-            
+
             # 尝试获取角点 logits
             if 'pred_vtx_logits_evolve_1' in teacher_output:
                 teacher_vtx = teacher_output['pred_vtx_logits_evolve_1']
+            elif 'pred_corners_init' in teacher_output:
+                teacher_vtx = teacher_output['pred_corners_init']
             else:
-                teacher_vtx = torch.zeros_like(teacher_polys[..., 0])
+                teacher_vtx = None
 
             probs = teacher_logits.sigmoid()
             top_scores, top_labels = probs.max(dim=-1)
 
             for i in range(len(top_scores)):
-                # 获取动态阈值 (类别0是建筑)
                 thr = criterion.dynamic_threshold.get_threshold(0)
                 keep = top_scores[i] > thr
-                
-                # 安全检查：如果没有一个框符合阈值
+
+                img_h, img_w = _get_valid_hw_from_mask(tgt_samples.mask[i])
+
                 if keep.sum() == 0:
-                    # 添加一个 dummy target 防止死循环或报错
-                    # 也可以选择不添加，但在 list comprehension 中需要处理空的情况
                     pseudo_targets.append({
                         'labels': torch.tensor([], dtype=torch.long, device=device),
-                        # [修改] 必须显式指定形状为 (0, 4)，否则 matcher 会报 1D 错误
-                        'boxes': torch.empty((0, 4), device=device), 
+                        'boxes': torch.empty((0, 4), device=device),
                         'poly_coords': torch.empty((0, 64, 2), device=device),
                         'corner_labels': torch.empty((0, 64), device=device)
                     })
                     continue
 
-                # 生成角点标签 (sigmoid > 0.5)
-                valid_vtx = teacher_vtx[i][keep]
-                pseudo_corner = (valid_vtx.sigmoid() > 0.5).float()
+                kept_polys = teacher_polys[i][keep]
+                kept_boxes = teacher_boxes[i][keep]
+                kept_labels = top_labels[i][keep]
+                kept_corners = teacher_vtx[i][keep] if teacher_vtx is not None else None
+
+                processed_polys = []
+                processed_corner_labels = []
+                processed_boxes = []
+                processed_labels = []
+
+                for det_idx in range(kept_polys.shape[0]):
+                    corner_scores = None if kept_corners is None else kept_corners[det_idx].sigmoid()
+                    sampled_poly, sampled_corner = process_polygon_with_corners(
+                        kept_polys[det_idx],
+                        corner_scores,
+                        img_h,
+                        img_w,
+                        corner_thresh,
+                        corner_nms_thresh,
+                        enable_corner_nms,
+                        num_corners=64,
+                    )
+
+                    if sampled_poly is None:
+                        continue
+
+                    processed_polys.append(sampled_poly)
+                    processed_corner_labels.append(sampled_corner)
+                    processed_boxes.append(kept_boxes[det_idx])
+                    processed_labels.append(kept_labels[det_idx])
+
+                if len(processed_polys) == 0:
+                    pseudo_targets.append({
+                        'labels': torch.tensor([], dtype=torch.long, device=device),
+                        'boxes': torch.empty((0, 4), device=device),
+                        'poly_coords': torch.empty((0, 64, 2), device=device),
+                        'corner_labels': torch.empty((0, 64), device=device)
+                    })
+                    continue
 
                 pseudo_targets.append({
-                    'labels': top_labels[i][keep],
-                    'boxes': teacher_boxes[i][keep],
-                    'poly_coords': teacher_polys[i][keep],
-                    'corner_labels': pseudo_corner
+                    'labels': torch.stack(processed_labels),
+                    'boxes': torch.stack(processed_boxes),
+                    'poly_coords': torch.stack(processed_polys),
+                    'corner_labels': torch.stack(processed_corner_labels)
                 })
 
         # 3. Student Forward
@@ -324,6 +478,15 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
 
     # [Fix] Epoch 结束时清理梯度，释放显存 (set_to_none=True 更高效)
     optimizer.zero_grad(set_to_none=True)
+
+    # [Active Memory Optimization]
+    import gc
+    del src_samples, src_targets, tgt_samples, loss_dict_sup, loss_dict_unsup, mae_res
+    if 'total_loss_val' in locals(): del total_loss_val
+    if 'teacher_output' in locals(): del teacher_output
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -414,4 +577,12 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         stats['PQ_all'] = panoptic_res["All"]
         stats['PQ_th'] = panoptic_res["Things"]
         stats['PQ_st'] = panoptic_res["Stuff"]
-    return stats, coco_evaluator
+    
+    # [Memory Optimization] Clean up evaluator to free memory
+    import gc
+    del coco_evaluator
+    del panoptic_evaluator
+    del loss_dict, loss_dict_reduced, loss_dict_reduced_scaled, loss_dict_reduced_unscaled
+    gc.collect()
+
+    return stats, None # Do not return the evaluator object to avoid keeping references
