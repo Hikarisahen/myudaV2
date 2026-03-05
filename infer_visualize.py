@@ -11,7 +11,10 @@ from main import get_args_parser
 from models import build_model
 from datasets.coco import make_coco_transforms
 from util.misc import nested_tensor_from_tensor_list
-
+'''
+使用下面的指令进行推理：
+python infer_visualize.py   --checkpoint weight/checkpoint_crowd.pth   --image_dir /data/zfx/datasets/LovaDA/Train/Urban/images_png    --vis_output_dir ./vis_out/originloveDA_threshhold05   --with_box_refine    --num_queries 300  --num_feature_levels 4    --dataset_file coco   --score_thresh 0.5    --corner_thresh 0.45    --onlycorner  --enable_nms
+'''
 
 def load_model(args, checkpoint_path):
     model, criterion, postprocessors = build_model(args)
@@ -212,6 +215,12 @@ def visualize_image(model, img_path, transform, device, save_dir, score_thresh=0
 
 def main():
     parser = get_args_parser()
+    # 解除训练专用必填项，推理不需要源/目标路径
+    for action in parser._actions:
+        if action.dest in {"source_path", "target_path"}:
+            action.required = False
+            action.default = ""
+
     parser.add_argument("--checkpoint", required=True, help="Path to checkpoint.pth")
     parser.add_argument("--image_path", help="Single image for inference")
     parser.add_argument("--image_dir", help="Folder containing images for batch inference")
@@ -272,4 +281,6 @@ if __name__ == "__main__":
         --vis_output_dir /home/data/zfx/DETR/SL1andfocal_train/vis_out
 
     python infer_visualize.py   --checkpoint weight/checkpoint_crowd.pth   --image_dir /data/zfx/datasets/CrowdAI/test_images/    --vis_output_dir ./vis_out/origincrowd4   --with_box_refine    --num_queries 300  --num_feature_levels 4    --dataset_file coco   --score_thresh 0.5    --corner_thresh 0.45    --onlycorner  --enable_nms --source_path "" --target_path ""
+
+    python infer_visualize.py   --checkpoint weight/checkpoint_crowd.pth   --image_dir /data/zfx/datasets/LovaDA/Train/Urban/images_png    --vis_output_dir ./vis_out/originloveDA_threshhold05   --with_box_refine    --num_queries 300  --num_feature_levels 4    --dataset_file coco   --score_thresh 0.5    --corner_thresh 0.45    --onlycorner  --enable_nms
     """

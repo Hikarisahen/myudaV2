@@ -16,7 +16,8 @@ def linear_stretch(img, percent=2):
     img_float = img.astype(np.float32)
     lower = np.percentile(img_float, percent)
     upper = np.percentile(img_float, 100 - percent)
-    img_stretched = (img_float - lower) / (upper - lower) * 255.0
+    denom = max(upper - lower, 1e-6)
+    img_stretched = (img_float - lower) / denom * 255.0
     img_stretched = np.clip(img_stretched, 0, 255).astype(np.uint8)
     return img_stretched
 
@@ -42,7 +43,7 @@ def load_ann_index(ann_path: Path):
     return anns_by_base, categories, info, licenses
 
 
-def process_annotations_for_crop(anns, scale, x0, y0, crop_size, ann_id_start, image_id):
+def process_annotations_for_crop(anns, scale, x0, y0, crop_size, ann_id_start, image_id, min_object_area):
     """将标注缩放+裁剪到当前 patch，返回新标注列表与下一个 ann_id。"""
     new_anns = []
     ann_id = ann_id_start
@@ -75,13 +76,17 @@ def process_annotations_for_crop(anns, scale, x0, y0, crop_size, ann_id_start, i
         bw = max(xmax - xmin, 1e-3)
         bh = max(ymax - ymin, 1e-3)
 
+        area = bw * bh
+        if area < min_object_area:  # 极小目标直接丢弃，避免噪声
+            continue
+
         new_ann = {
             "id": ann_id,
             "image_id": image_id,
             "category_id": ann["category_id"],
             "segmentation": [coords.reshape(-1).tolist()],
             "bbox": [float(xmin), float(ymin), float(bw), float(bh)],
-            "area": float(bw * bh),
+            "area": float(area),
             "iscrowd": ann.get("iscrowd", 0),
         }
         if "cor_cls_poly" in ann:
@@ -93,7 +98,8 @@ def process_annotations_for_crop(anns, scale, x0, y0, crop_size, ann_id_start, i
 
 
 def preprocess_image(large_img_path, output_dir, target_scale, crop_size, overlap, anns_for_img=None,
-                     ann_id_start=1, image_id_start=1):
+                     ann_id_start=1, image_id_start=1, min_crop_mean=5.0, min_object_area=16.0,
+                     save_format="jpg"):
     filename = os.path.basename(large_img_path)
     base_name = os.path.splitext(filename)[0]
 
@@ -121,6 +127,8 @@ def preprocess_image(large_img_path, output_dir, target_scale, crop_size, overla
     os.makedirs(output_dir, exist_ok=True)
 
     stride = crop_size - overlap
+    if stride <= 0:
+        raise ValueError(f"Stride must be positive, got crop_size={crop_size}, overlap={overlap}")
     rows = math.ceil((new_h - crop_size) / stride) + 1
     cols = math.ceil((new_w - crop_size) / stride) + 1
 
@@ -143,10 +151,10 @@ def preprocess_image(large_img_path, output_dir, target_scale, crop_size, overla
                 x_start = max(0, x_end - crop_size)
 
             crop = img_resized_bgr[y_start:y_start + crop_size, x_start:x_start + crop_size]
-            if crop.mean() < 5:
+            if crop.mean() < min_crop_mean:
                 continue
-
-            save_name = f"{base_name}_crop_{r}_{c}.jpg"
+            ext = ".jpg" if save_format == "jpg" else ".png"
+            save_name = f"{base_name}_crop_{r}_{c}{ext}"
             cv2.imwrite(os.path.join(output_dir, save_name), crop)
 
             if anns_for_img is not None:
@@ -158,6 +166,7 @@ def preprocess_image(large_img_path, output_dir, target_scale, crop_size, overla
                     crop_size=crop_size,
                     ann_id_start=ann_id,
                     image_id=image_id,
+                    min_object_area=min_object_area,
                 )
                 new_anns_all.extend(new_anns)
 
@@ -180,6 +189,9 @@ def main():
     parser.add_argument("--target_scale", type=float, default=2.5, help="放大倍数")
     parser.add_argument("--crop_size", type=int, default=320, help="切片尺寸")
     parser.add_argument("--overlap", type=int, default=100, help="切片重叠")
+    parser.add_argument("--min_crop_mean", type=float, default=5.0, help="丢弃均值过低的黑片")
+    parser.add_argument("--min_object_area", type=float, default=16.0, help="裁剪后最小保留目标面积 (像素)")
+    parser.add_argument("--save_format", choices=["jpg", "png"], default="jpg", help="输出切片格式")
     parser.add_argument("--ann", type=str, default=None, help="可选：COCO 标注 json，若提供则同步裁剪标注")
     parser.add_argument("--out_ann", type=str, default=None, help="输出标注 json 路径，默认 output_dir/annotation_cropped.json")
     args = parser.parse_args()
@@ -220,6 +232,9 @@ def main():
             anns_for_img=anns_for_img,
             ann_id_start=ann_id,
             image_id_start=image_id,
+            min_crop_mean=args.min_crop_mean,
+            min_object_area=args.min_object_area,
+            save_format=args.save_format,
         )
         all_images.extend(imgs)
         all_annotations.extend(anns)
@@ -245,6 +260,7 @@ if __name__ == "__main__":
         --input_dir /data/zfx/datasets/WHU/train \
         --output_dir /data/zfx/datasets/WHUuda2/train \
         --target_scale 1 --crop_size 320 --overlap 100 \
+        --min_crop_mean 5 --min_object_area 16 --save_format jpg \
         --ann /data/zfx/datasets/WHU/annotation/train.json \
         --out_ann /data/zfx/datasets/WHUuda2/train/annotation_cropped.json
     """

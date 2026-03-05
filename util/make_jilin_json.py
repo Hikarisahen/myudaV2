@@ -6,23 +6,27 @@ from tqdm import tqdm
 
 # ================= 配置区域 =================
 # 必须与你报错信息中的路径完全一致
-IMAGE_DIR = "/data/zfx/datasets/Jilin-1/train"
-JSON_OUTPUT_PATH = "/data/zfx/datasets/Jilin-1/train/annotation_detr.json"
+IMAGE_DIR = "/data/zfx/datasets/GoogleMap/train"
+JSON_OUTPUT_PATH = "/data/zfx/datasets/GoogleMap/train/annotation_detr.json"
 # ===========================================
+
 
 def generate_json():
     print(f"正在扫描目录: {IMAGE_DIR} ...")
     
-    # 1. 扫描所有 jpg 图片
+    # 1. 扫描所有图片（支持 jpg/png）
     if not os.path.exists(IMAGE_DIR):
         print(f"Error: 找不到目录 {IMAGE_DIR}")
         return
 
-    image_paths = glob.glob(os.path.join(IMAGE_DIR, "*.jpg"))
+    exts = ["*.jpg", "*.jpeg", "*.png", "*.PNG", "*.JPG", "*.JPEG"]
+    image_paths = []
+    for ext in exts:
+        image_paths.extend(glob.glob(os.path.join(IMAGE_DIR, ext)))
     image_paths.sort() # 排序保证顺序一致
     
     if len(image_paths) == 0:
-        print("Error: 目录下没有找到 .jpg 图片！请检查预处理步骤是否完成。")
+        print("Error: 目录下没有找到 .jpg/.png 图片！请检查预处理步骤是否完成。")
         return
 
     images = []

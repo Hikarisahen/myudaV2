@@ -244,6 +244,20 @@ def build(image_set, args):
     } # CrowdAI 数据集文件结构
 
     img_folder, ann_file = PATHS[image_set]
+
+    # 兼容非指定组织结构的路径
+    if not img_folder.exists() or not ann_file.exists():
+        flat_ann = root / "annotation_detr.json"
+        if flat_ann.exists():
+            img_folder = root
+            ann_file = flat_ann
+            print(f"[Info] Using flat layout for {image_set}: images at {img_folder}, ann at {ann_file}")
+        else:
+            missing = []
+            if not img_folder.exists(): missing.append(str(img_folder))
+            if not ann_file.exists(): missing.append(str(ann_file))
+            raise FileNotFoundError(f"Missing dataset path(s): {', '.join(missing)}")
+
     dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(image_set), return_masks=args.masks,
                             cache_mode=args.cache_mode, local_rank=get_local_rank(), local_size=get_local_size())
     return dataset

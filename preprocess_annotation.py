@@ -222,62 +222,87 @@ def uniform_sampling(gt_pts, num_corners, width, height):
 def uniform_sampling_vectorized(gt_pts, num_corners):
     """
     矢量化均匀采样，并进行角点对齐。
-    修改点：
-    1. 标签逻辑：角点=1, 非角点=0。
-    2. 防止多个GT角点抢占同一个采样点。
-    """
-    pts = np.array(gt_pts).reshape(-1, 2)
+    适配 engine.py 的在线训练需求。
     
-    # 确保闭合
-    if not np.array_equal(pts[0], pts[-1]):
-        pts = np.vstack([pts, pts[0]])
-
-    # 计算边长和周长
-    diffs = np.diff(pts, axis=0)
-    dists = np.linalg.norm(diffs, axis=1)
-    perimeter = np.sum(dists)
-    
-    if perimeter == 0:
-        return None, None
-
-    # 累积距离 [0, d1, d1+d2, ..., perimeter]
-    cum_dists = np.concatenate([[0], np.cumsum(dists)])
-
-    # 生成均匀采样位置
-    sample_locs = np.linspace(0, perimeter, num_corners, endpoint=False)
-    
-    # 线性插值计算采样点坐标
-    new_x = np.interp(sample_locs, cum_dists, pts[:, 0])
-    new_y = np.interp(sample_locs, cum_dists, pts[:, 1])
-    sampled_pts = np.stack([new_x, new_y], axis=1) # Shape: (num_corners, 2)
-
-    # --- Corner Alignment Logic ---
-    # 定义标签：默认为 0 (非角点/墙体点)
-    corner_label = np.zeros((num_corners,), dtype=np.int32) 
-    
-    # 原始GT角点（去除重复尾点）
-    orig_pts = pts[:-1]
-    
-    # 计算距离矩阵 (N_gt, N_sampled)
-    dists_matrix = np.linalg.norm(orig_pts[:, None, :] - sampled_pts[None, :, :], axis=2)
-    
-    # 找到每个GT角点最近的采样点索引
-    min_indices = np.argmin(dists_matrix, axis=1)
-    
-    # 执行替换和标记
-    # 使用一个集合来记录已经被占用的采样点，防止冲突
-    used_indices = set()
-    
-    for gt_idx, sample_idx in enumerate(min_indices):
-        # 如果这个采样点已经被别的角点占了，且当前GT角点距离下一采样点更近（简单冲突处理策略）
-        # 这里为了简单，如果发生冲突，我们优先保留先遇到的角点，或者不做处理直接覆盖
-        # 实际遥感建筑中，如果num_corners=64，冲突概率很低。
+    Args:
+        gt_pts: list or np.ndarray, shape (N, 2) or (N*2,). 
+                The raw polygon coordinates.
+        num_corners: int. Target number of points (e.g., 64).
         
-        sampled_pts[sample_idx] = orig_pts[gt_idx] # 强制吸附
-        corner_label[sample_idx] = 1 # 标记为角点 (Class 1)
-        used_indices.add(sample_idx)
+    Returns:
+        sampled_flat: np.array (float32), shape (num_corners * 2,). Flattened coordinates.
+        corner_label: np.array (int32), shape (num_corners,). 1 for corner, 0 for edge.
+    """
+    try:
+        pts = np.array(gt_pts).reshape(-1, 2)
+        
+        # 1. 异常处理：点数太少
+        if len(pts) < 3:
+            # 退化情况：直接重复第一个点
+            # 这种情况在训练中极少见，但为了防止报错崩掉训练进程
+            return np.tile(pts[0], num_corners).flatten(), np.zeros(num_corners, dtype=np.int32)
 
-    return sampled_pts.flatten(), corner_label
+        # 2. 确保闭合 (用于计算周长)
+        if not np.array_equal(pts[0], pts[-1]):
+            pts_closed = np.vstack([pts, pts[0]])
+        else:
+            pts_closed = pts
+
+        # 3. 计算边长和周长
+        diffs = np.diff(pts_closed, axis=0)
+        dists = np.linalg.norm(diffs, axis=1)
+        perimeter = np.sum(dists)
+        
+        if perimeter < 1e-6:
+            return np.tile(pts[0], num_corners).flatten(), np.zeros(num_corners, dtype=np.int32)
+
+        # 4. 累积距离 [0, d1, d1+d2, ..., perimeter]
+        cum_dists = np.concatenate([[0], np.cumsum(dists)])
+
+        # 5. 生成均匀采样位置
+        # 注意：使用 endpoint=False，因为闭合多边形的起点和终点是同一个逻辑点
+        sample_locs = np.linspace(0, perimeter, num_corners, endpoint=False)
+        
+        # 6. 线性插值计算采样点坐标
+        # np.interp 需要 x 坐标单调递增，cum_dists 满足该条件
+        new_x = np.interp(sample_locs, cum_dists, pts_closed[:, 0])
+        new_y = np.interp(sample_locs, cum_dists, pts_closed[:, 1])
+        sampled_pts = np.stack([new_x, new_y], axis=1) # Shape: (num_corners, 2)
+
+        # --- 7. 角点对齐逻辑 (Corner Alignment) ---
+        # 定义标签：默认为 0 (非角点/墙体点)
+        corner_label = np.zeros((num_corners,), dtype=np.int32) 
+        
+        # 原始GT角点（去除重复尾点，如果输入未闭合则就是 pts）
+        # 逻辑：真实的几何角点应该“吸附”到最近的采样点上
+        if np.array_equal(pts[0], pts[-1]):
+            orig_pts = pts[:-1]
+        else:
+            orig_pts = pts
+        
+        # 计算距离矩阵 (N_gt, N_sampled)
+        # 利用广播机制计算所有对的距离
+        dists_matrix = np.linalg.norm(orig_pts[:, None, :] - sampled_pts[None, :, :], axis=2)
+        
+        # 找到每个GT角点最近的采样点索引
+        min_indices = np.argmin(dists_matrix, axis=1)
+        
+        # 执行替换和标记
+        for gt_idx, sample_idx in enumerate(min_indices):
+            # 强制将该采样点移动到真实的角点位置 (Pixel-perfect alignment)
+            sampled_pts[sample_idx] = orig_pts[gt_idx] 
+            # 标记为角点 (Class 1)
+            corner_label[sample_idx] = 1 
+
+        return sampled_pts.flatten(), corner_label
+
+    except Exception as e:
+        print(f"Error in uniform_sampling: {e}")
+        # Fallback
+        if len(gt_pts) > 0:
+            p0 = np.array(gt_pts).reshape(-1, 2)[0]
+            return np.tile(p0, num_corners).flatten(), np.zeros(num_corners, dtype=np.int32)
+        return None, None
 
 
 def get_gt_bboxes(gt_pts, width, height):

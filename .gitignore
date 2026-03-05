@@ -6,3 +6,5 @@ vis_out
 weight/checkpoint_crowd.pth
 uda_jilin_run_v*
 uda_whu_run_v*
+*.pth
+*.png

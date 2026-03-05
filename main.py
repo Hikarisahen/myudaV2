@@ -49,10 +49,20 @@ CUSTOM_VIS_IMAGE_PATHS = [
     # "/data/zfx/datasets/Jilin-1/train/images/tile_0_crop_68_82.jpg",
     # "/data/zfx/datasets/Jilin-1/train/images/tile_0_crop_79_5.jpg",
     # WHU
+    # "/data/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
+    # "/data/zfx/datasets/WHUuda/train/images/1000121_crop_4_4.jpg",  # 建筑物
+    # "/data/zfx/datasets/WHUuda/train/images/1000267_crop_0_2.jpg",  # 道路负样本
+    # "/data/zfx/datasets/WHUuda/train/images/10002218_crop_4_3.jpg",  # 复杂建筑物
+    # GoogleMap
+    # "/data/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
+    # "/data/zfx/datasets/GoogleMap/train/images/target_domain_000121.jpg",  # 建筑物
+    # "/data/zfx/datasets/GoogleMap/train/images/target_domain_000152.jpg",  
+    # "/data/zfx/datasets/GoogleMap/train/images/target_domain_000237.jpg",  
+    # GoogleMap
     "/data/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
-    "/data/zfx/datasets/WHUuda/train/images/3001001_crop_0_1.jpg",  # 建筑物
-    "/data/zfx/datasets/WHUuda/train/images/3001007_crop_3_2.jpg",  # 道路负样本
-    "/data/zfx/datasets/WHUuda/train/images/300490_crop_0_2.jpg",  # 简单建筑物
+    "/data/zfx/datasets/LovaDA/Train/Urban/images_png/2147.png",  # 简单大型建筑物
+    "/data/zfx/datasets/LovaDA/Train/Urban/images_png/1474.png",  # 稍复杂小建筑物
+    "/data/zfx/datasets/LovaDA/Train/Urban/images_png/1630.png",  # 复杂立体建筑物
 ]
 
 def get_args_parser():
@@ -246,6 +256,55 @@ def load_custom_vis_samples(image_paths, dataset):
         return None
     return nested_tensor_from_tensor_list(tensors)
 
+def selective_retraining(student_model, source_checkpoint_path):
+    """
+    [MRT 核心策略] 选择性重训练机制
+    
+    逻辑：
+    1. 加载源域预训练权重 (Clean Source Weights)。
+    2. 将 Student 模型的 Backbone 和 Transformer Encoder 重置为源域权重。
+    3. 保留 Student 模型的 Decoder 和 Prediction Heads (它们包含了对 Target 域的适应知识)。
+    
+    这相当于：保留“怎么检测物体”的知识(Decoder)，重置“怎么看图”的知识(Encoder)，
+    防止 Encoder 对错误的伪标签过拟合。
+    """
+    if not source_checkpoint_path or not os.path.exists(source_checkpoint_path):
+        print(f"⚠️ [Warning] Cannot find source checkpoint at {source_checkpoint_path}. Skipping selective retraining.")
+        return
+
+    print(f"🔄 [Selective Retraining] Loading clean weights from {source_checkpoint_path}...")
+    
+    # 1. 加载纯净的源域权重
+    checkpoint = torch.load(source_checkpoint_path, map_location='cpu', weights_only=False)
+    src_state_dict = checkpoint['model']
+    
+    # 2. 获取当前 Student 的权重
+    student_state_dict = student_model.state_dict()
+    
+    # 3. 筛选并覆盖
+    reset_count = 0
+    keys_to_reset = []
+    
+    for key in student_state_dict.keys():
+        # MRT 论文结论: 重置 Backbone 和 Encoder 效果最好
+        # 关键词匹配: 'backbone', 'transformer.encoder', 'input_proj'
+        if ('backbone' in key or 
+            'transformer.encoder' in key or 
+            'input_proj' in key):
+            
+            if key in src_state_dict:
+                student_state_dict[key] = src_state_dict[key]
+                keys_to_reset.append(key)
+                reset_count += 1
+            else:
+                # 这种情况很少见，除非模型结构变了
+                pass
+    
+    # 4. 加载回模型
+    student_model.load_state_dict(student_state_dict, strict=False)
+    print(f"✅ [Selective Retraining] Successfully reset {reset_count} parameters (Backbone + Encoder). Decoder kept.")
+
+
 def main(args):
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
@@ -293,6 +352,8 @@ def main(args):
     # 或者如果 build_dataset 支持纯图片文件夹请相应调整。
     # 这里假设 Jilin-1 遵循 COCO 格式。
     dataset_target_train = build_dataset(image_set='train', args=args)
+    # Target 评估集（如无独立 val，则用 train 顺序遍历）
+    dataset_target_eval = dataset_target_train
     
     # 3.3 加载验证集 (Source 的验证集，用于监控性能)
     # 也可以加载 Target 的验证集如果有的话
@@ -306,14 +367,17 @@ def main(args):
             sampler_source = samplers.NodeDistributedSampler(dataset_source_train)
             sampler_target = samplers.NodeDistributedSampler(dataset_target_train)
             sampler_val = samplers.NodeDistributedSampler(dataset_val, shuffle=False)
+            sampler_target_eval = samplers.NodeDistributedSampler(dataset_target_eval, shuffle=False)
         else:
             sampler_source = samplers.DistributedSampler(dataset_source_train)
             sampler_target = samplers.DistributedSampler(dataset_target_train)
             sampler_val = samplers.DistributedSampler(dataset_val, shuffle=False)
+            sampler_target_eval = samplers.DistributedSampler(dataset_target_eval, shuffle=False)
     else:
         sampler_source = torch.utils.data.RandomSampler(dataset_source_train)
         sampler_target = torch.utils.data.RandomSampler(dataset_target_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        sampler_target_eval = torch.utils.data.SequentialSampler(dataset_target_eval)
 
     batch_sampler_source = torch.utils.data.BatchSampler(sampler_source, args.batch_size, drop_last=True)
     batch_sampler_target = torch.utils.data.BatchSampler(sampler_target, args.batch_size, drop_last=True)
@@ -327,6 +391,9 @@ def main(args):
                                    pin_memory=False)
 
     data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
+                                 drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers,
+                                 pin_memory=False)
+    data_loader_target_eval = DataLoader(dataset_target_eval, args.batch_size, sampler=sampler_target_eval,
                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers,
                                  pin_memory=False)
 
@@ -385,6 +452,7 @@ def main(args):
         base_ds = get_coco_api_from_dataset(coco_val)
     else:
         base_ds = get_coco_api_from_dataset(dataset_val)
+    base_ds_target = get_coco_api_from_dataset(dataset_target_eval)
 
     # 6. 加载预训练权重 (Student & Teacher)
     # 如果指定了 resume，则加载 checkpoint
@@ -443,29 +511,34 @@ def main(args):
     print("Start UDA training")
     start_time = time.time()
     
+    # [MRT] 设置重训练间隔 (论文建议 10 或 40，针对你的情况建议 10)
+    RETRAIN_INTERVAL = 10
+    
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_source.set_epoch(epoch)
             sampler_target.set_epoch(epoch)
 
         # ---------------------------------------------------------------------
-        # Selective Retraining 逻辑 (MRT Paper)
-        # 每隔 10 个 Epoch，将 Student 的 Encoder 重置为当前 Encoder 的状态
-        # (在我们的实现中，Student 一直在做 MAE，所以 Encoder 已经是 Refined 过的)
-        # 这里模拟 "Retraining"：可以理解为一次 Checkpoint，或者更激进的重置 Head
-        # 为了稳定性，我们这里暂不重置 Head，而是打印日志确认 MAE 正在工作
+        # [MRT] Selective Retraining Trigger
+        # 逻辑：
+        # 1. 跳过 Burn-in 阶段 (前 10 epoch 不重置，让模型先跑热)
+        # 2. 只有在特定间隔触发 (e.g., Epoch 10, 20, 30...)
         # ---------------------------------------------------------------------
-        if epoch % 10 == 0 and epoch > 0:
-            print(f"[Selective Retraining] Epoch {epoch}: Keeping Encoder weights derived from MAE task.")
-            # 如果想要激进的重置，可以解除下面代码的注释：
-            # print("Re-initializing Detection Head...")
-            # model_without_ddp.class_embed.reset_parameters()
-            # model_without_ddp.bbox_embed.reset_parameters()
+        if epoch > 0 and epoch % RETRAIN_INTERVAL == 0:
+            print(f"\n⚡ Triggering Selective Retraining at Epoch {epoch} ⚡")
+            # 注意：传入 model_without_ddp 以避免 DDP 包装器的前缀问题
+            # args.resume 必须指向你的 checkpoint_crowd.pth (源域预训练权重)
+            selective_retraining(model_without_ddp, args.resume)
+            
+            # [Optional] 重置后，为了防止梯度动量(Momentum)依然指向错误的方向，
+            # 有些策略会清空优化器状态，但 AdamW 通常能自适应调整，这里暂不清除以保持训练平滑。
+        # ---------------------------------------------------------------------
 
-        # 调用我们修改过的 UDA 训练函数
+        # 调用训练函数 (使用我们刚刚优化过的 engine.py)
         train_stats = train_one_epoch(
             student=model,
-            teacher=teacher_model, # 传入 Teacher
+            teacher=teacher_model,
             criterion=criterion,
             data_loader_source=data_loader_source,
             data_loader_target=data_loader_target,
@@ -473,7 +546,7 @@ def main(args):
             device=device,
             epoch=epoch,
             max_norm=args.clip_max_norm,
-            args=args # 传入 args 以获取 lambda
+            args=args 
         )
         
         lr_scheduler.step()
@@ -501,14 +574,57 @@ def main(args):
 
         # Eval (使用 Teacher 模型评估，通常 Teacher 泛化更好)
         test_stats = {}
-        if (epoch + 1) % 20 == 0 or (epoch + 1) == args.epochs:
+        test_bbox_ap = None
+        test_bbox_ap50 = None
+        test_bbox_ap75 = None
+        # 评估周期 评估间隔周期
+        if (epoch + 1) % 120 == 0 or (epoch + 1) == args.epochs:
             print(f"Evaluating Teacher Model at epoch {epoch}...")
             test_stats, coco_evaluator = evaluate(
                 teacher_model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
             )
+            if 'coco_eval_bbox' in test_stats:
+                test_bbox_ap = test_stats['coco_eval_bbox'][0]
+                if len(test_stats['coco_eval_bbox']) > 2:
+                    test_bbox_ap50 = test_stats['coco_eval_bbox'][1]
+                    test_bbox_ap75 = test_stats['coco_eval_bbox'][2]
+
+        # 每轮记录 Teacher 在目标域上的表现（使用 target_eval loader）
+        target_test_stats = {}
+        target_bbox_ap = None
+        target_bbox_ap50 = None
+        target_bbox_ap75 = None
+        target_has_ann = False
+        try:
+            target_has_ann = hasattr(base_ds_target, "dataset") and \
+                             len(base_ds_target.dataset.get("annotations", [])) > 0
+        except Exception:
+            target_has_ann = False
+
+        if target_has_ann:
+            try:
+                target_test_stats, _ = evaluate(
+                    teacher_model, criterion, postprocessors, data_loader_target_eval, base_ds_target, device, args.output_dir
+                )
+                if 'coco_eval_bbox' in target_test_stats:
+                    target_bbox_ap = target_test_stats['coco_eval_bbox'][0]
+                    if len(target_test_stats['coco_eval_bbox']) > 2:
+                        target_bbox_ap50 = target_test_stats['coco_eval_bbox'][1]
+                        target_bbox_ap75 = target_test_stats['coco_eval_bbox'][2]
+            except Exception as e:
+                print(f"Target eval failed: {e}")
+        else:
+            print("Target eval skipped: no annotations found in target dataset.")
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
+                     **{f'target_{k}': v for k, v in target_test_stats.items()},
+                     'test_bbox_mAP': test_bbox_ap,
+                     'test_bbox_AP50': test_bbox_ap50,
+                     'test_bbox_AP75': test_bbox_ap75,
+                     'target_bbox_mAP': target_bbox_ap,
+                     'target_bbox_AP50': target_bbox_ap50,
+                     'target_bbox_AP75': target_bbox_ap75,
                      'epoch': epoch,
                      'n_parameters': n_parameters}
 
