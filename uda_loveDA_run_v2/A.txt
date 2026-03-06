@@ -1,0 +1,12 @@
+RETRAIN_INTERVAL = 10 重训间隔
+burn_in_epochs = 5 只做 Source + MAE，完全忽略 Teacher 伪标签
+ramp_epochs = 10 Burn-in 后，缓慢增加lambda_unsup权重 (Ramp-up)
+EMA alpha: 0.998   越大，Teacher 越“慢”、越稳 0.996 属于偏稳
+FDA beta: 0.05 控制频域低频替换面积（风格迁移强度）。 越大，源图更像目标域风格（域对齐更强），但过大可能引入失真，影响监督分支稳定
+pseudo box NMS IoU: 0.4 伪标签框做 NMS 的阈值。 IoU > 0.5 的重叠框会被抑制，减少重复伪框。阈值越低越“狠”，伪框数量会更少。
+DynamicThreshold：min_threshold=0.18, 下限，防止阈值太低导致大量噪声伪标签。 # 放宽下限，让早期目标域不过度空缺 
+                 initial_threshold=0.28,初始阈值，早期更容易产生伪标签 # 更低初始值，便于起步
+                 max_threshold=0.45, 上限，防止阈值无限增大（但 0.6 仍可能偏严）# 论文上限 
+                 gamma=0.95, 
+                 a=0.8, # 论文参数 a [cite: 508]
+                 b=1.0  # 论文参数 b [cite: 508]

@@ -35,12 +35,12 @@ class DynamicThreshold:
     
     """
     def __init__(self, num_classes, 
-                 min_threshold=0.2, # 放宽下限，让早期目标域不过度空缺
-                 initial_threshold=0.25, # 更低初始值，便于起步
-                 max_threshold=0.6, # 论文上限 
-                 gamma=0.9, 
-                 a=0.9, # 论文参数 a [cite: 508]
-                 b=0.5  # 论文参数 b [cite: 508]
+                 min_threshold=0.18, # 放宽下限，让早期目标域不过度空缺
+                 initial_threshold=0.28, # 更低初始值，便于起步
+                 max_threshold=0.45, # 论文上限 
+                 gamma=0.95, 
+                 a=0.8, # 论文参数 a [cite: 508]
+                 b=1.0  # 论文参数 b [cite: 508]
                  ):
         self.thresholds = torch.full((num_classes,), initial_threshold).cuda()
         self.min_threshold = min_threshold
@@ -215,7 +215,7 @@ def process_polygon_with_corners(poly_norm: torch.Tensor, corner_scores: torch.T
 # Helper Function 3: EMA Update
 # =============================================================================
 @torch.no_grad()
-def update_teacher(student_model, teacher_model, alpha=0.996):
+def update_teacher(student_model, teacher_model, alpha=0.998):
     """
     Teacher = alpha * Teacher + (1-alpha) * Student
     调低 alpha 让 Teacher 更快跟随，早期目标域更易出框
@@ -273,7 +273,7 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
         else:
             # Burn-in 后，缓慢增加权重 (Ramp-up)
             # 例如 10-20 epoch 从 0 线性增加到 target_lambda
-            ramp_epochs = 10
+            ramp_epochs = 30
             progress = min(1.0, max(0.0, epoch - burn_in_epochs) / ramp_epochs)
             lambda_unsup = args.lambda_unsup * progress
             
@@ -285,7 +285,7 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
 
         # 2. FDA Style Transfer (Source -> Target Style)
         # 即使在 burn-in 阶段也做 FDA，让 Student 适应 Target 风格
-        src_imgs_stylized = FDA_source_to_target(src_imgs, tgt_imgs, beta=0.09)
+        src_imgs_stylized = FDA_source_to_target(src_imgs, tgt_imgs, beta=0.05)
         src_samples_stylized = utils.NestedTensor(src_imgs_stylized, src_samples.mask)
 
         # 3. Teacher Generate Pseudo Labels
@@ -295,6 +295,9 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
             corner_thresh = getattr(args, 'pseudo_corner_thresh', 0.45)
             corner_nms_thresh = getattr(args, 'pseudo_corner_nms_thresh', 10.0)
             enable_corner_nms = not getattr(args, 'disable_pseudo_corner_nms', False)
+            pseudo_thr_floor = getattr(args, 'pseudo_thr_floor', 0.28)
+            pseudo_min_box_area = getattr(args, 'pseudo_min_box_area', 0.001)
+            pseudo_topk = getattr(args, 'pseudo_topk', 80)
             
             with torch.no_grad():
                 teacher_output = teacher(tgt_samples)
@@ -316,7 +319,7 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
                     # [MRT] 获取 Source-Guided 动态阈值
                     thr = criterion.dynamic_threshold.get_threshold(0)
                     # 放宽下限，增加目标域伪标签覆盖
-                    thr = max(thr, 0.2) 
+                    thr = max(thr, pseudo_thr_floor)
                     
                     # 3.1 初步筛选
                     keep_idxs = torch.where(top_scores[i] > thr)[0]
@@ -341,13 +344,51 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
                     # 3.2 [新增] Box NMS 过滤重叠框
                     # DETR cxcywh -> xyxy
                     sel_boxes_xyxy = box_cxcywh_to_xyxy(sel_boxes)
-                    keep_nms = ops.nms(sel_boxes_xyxy, sel_scores, iou_threshold=0.5)
+                    keep_nms = ops.nms(sel_boxes_xyxy, sel_scores, iou_threshold=0.4)
                     
                     # 应用 NMS
                     sel_boxes = sel_boxes[keep_nms]
+                    sel_scores = sel_scores[keep_nms]
                     sel_polys = sel_polys[keep_nms]
                     sel_labels = sel_labels[keep_nms]
                     sel_vtx = sel_vtx[keep_nms] if sel_vtx is not None else None
+
+                    if sel_boxes.shape[0] == 0:
+                        pseudo_targets.append({
+                            'labels': torch.tensor([], dtype=torch.long, device=device),
+                            'boxes': torch.empty((0, 4), device=device),
+                            'poly_coords': torch.empty((0, 64, 2), device=device),
+                            'corner_labels': torch.empty((0, 64), device=device)
+                        })
+                        continue
+
+                    # 3.2.1 [新增] 过滤过小伪框，抑制目标域小伪影
+                    box_area = sel_boxes[:, 2].clamp(min=0) * sel_boxes[:, 3].clamp(min=0)
+                    keep_area = torch.where(box_area >= pseudo_min_box_area)[0]
+
+                    if keep_area.shape[0] == 0:
+                        pseudo_targets.append({
+                            'labels': torch.tensor([], dtype=torch.long, device=device),
+                            'boxes': torch.empty((0, 4), device=device),
+                            'poly_coords': torch.empty((0, 64, 2), device=device),
+                            'corner_labels': torch.empty((0, 64), device=device)
+                        })
+                        continue
+
+                    sel_boxes = sel_boxes[keep_area]
+                    sel_scores = sel_scores[keep_area]
+                    sel_polys = sel_polys[keep_area]
+                    sel_labels = sel_labels[keep_area]
+                    sel_vtx = sel_vtx[keep_area] if sel_vtx is not None else None
+
+                    # 3.2.2 [新增] 每图仅保留高分 Top-K，抑制密集噪声伪框
+                    if pseudo_topk > 0 and sel_scores.shape[0] > pseudo_topk:
+                        topk_idx = torch.topk(sel_scores, k=pseudo_topk).indices
+                        sel_boxes = sel_boxes[topk_idx]
+                        sel_scores = sel_scores[topk_idx]
+                        sel_polys = sel_polys[topk_idx]
+                        sel_labels = sel_labels[topk_idx]
+                        sel_vtx = sel_vtx[topk_idx] if sel_vtx is not None else None
                     
                     # 3.3 处理多边形和角点 (含 Corner NMS)
                     img_h, img_w = _get_valid_hw_from_mask(tgt_samples.mask[i])
