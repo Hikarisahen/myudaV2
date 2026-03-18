@@ -7,6 +7,7 @@
 import sys
 import os
 import copy  # [新增] 用于复制 Teacher 模型
+import shlex
 
 # === [新增] 强行加入算子目录到系统路径 ===
 sys.path.append(os.path.join(os.path.dirname(__file__), 'models/ops'))
@@ -72,12 +73,43 @@ def get_args_parser():
     parser.add_argument('--source_path', type=str, required=True, help="Path to Source Dataset (e.g., CrowdAI)")
     parser.add_argument('--target_path', type=str, required=True, help="Path to Target Dataset (e.g., Jilin-1)")
     parser.add_argument('--use_mae', action='store_true', help="Enable MAE branch for UDA")
-    parser.add_argument('--lambda_unsup', default=1.0, type=float, help="Weight for unsupervised loss")
+    parser.add_argument('--lambda_unsup', default=0.4, type=float, help="Weight for unsupervised loss")
     parser.add_argument('--lambda_mae', default=1.0, type=float, help="Weight for MAE reconstruction loss")
     parser.add_argument('--mask_ratio', default=0.75, type=float, help="Mask ratio for MAE")
     parser.add_argument('--pseudo_corner_thresh', default=0.45, type=float, help="教师伪标签角点分数阈值")
     parser.add_argument('--pseudo_corner_nms_thresh', default=10.0, type=float, help="教师伪标签角点NMS距离阈值（像素）")
     parser.add_argument('--disable_pseudo_corner_nms', action='store_true', help="构建教师伪标签时禁用角点NMS")
+    parser.add_argument('--pseudo_thr_init', default=0.34, type=float, help="自适应伪标签阈值EMA初始值")
+    parser.add_argument('--pseudo_thr_min', default=0.30, type=float, help="自适应伪标签阈值最小值")
+    parser.add_argument('--pseudo_thr_max', default=0.60, type=float, help="自适应伪标签阈值最大值")
+    parser.add_argument('--pseudo_thr_quantile', default=0.94, type=float, help="目标域置信度分位数，用于估计目标阈值")
+    parser.add_argument('--pseudo_thr_target_ema_momentum', default=0.95, type=float, help="目标域分位数阈值EMA动量")
+    parser.add_argument('--pseudo_thr_source_weight', default=0.20, type=float, help="融合阈值中source动态阈值权重")
+    parser.add_argument('--pseudo_thr_target_weight', default=0.80, type=float, help="融合阈值中target分位数EMA权重")
+    parser.add_argument('--pseudo_topk', default=25, type=int, help="每张图最多保留的伪标签数量")
+    parser.add_argument('--pseudo_min_box_area', default=0.004, type=float, help="伪标签最小框面积（归一化wh面积）")
+    parser.add_argument('--burn_in_epochs', default=5, type=int,
+                        help="Burn-in epochs: train with Source supervision + Target MAE only")
+    parser.add_argument('--retrain_interval', default=0, type=int,
+                        help="[兼容旧参数] 若>0则覆盖阶段1重训间隔")
+    parser.add_argument('--retrain_stage1_epochs', default=60, type=int,
+                        help="第二阶段前期长度（按 stage2_epoch 计）")
+    parser.add_argument('--retrain_stage1_interval', default=10, type=int,
+                        help="第二阶段前期重训间隔")
+    parser.add_argument('--retrain_stage2_epochs', default=60, type=int,
+                        help="第二阶段中期长度（按 stage2_epoch 计）")
+    parser.add_argument('--retrain_stage2_interval', default=20, type=int,
+                        help="第二阶段中期重训间隔")
+    parser.add_argument('--retrain_stage3_interval', default=30, type=int,
+                        help="第二阶段后期重训间隔（0表示关闭）")
+    parser.add_argument('--retrain_force_resume', action='store_true',
+                        help="重训时强制使用--resume权重，不使用theta_mask_clean")
+    parser.add_argument('--disable_retrain_gate', action='store_true',
+                        help="禁用重训门控（只按阶段周期触发）")
+    parser.add_argument('--retrain_gate_conf_mean_max', default=0.26, type=float,
+                        help="门控阈值：上一轮 avg_conf <= 该值时允许重训")
+    parser.add_argument('--retrain_gate_conf_kept_max', default=0.55, type=float,
+                        help="门控阈值：上一轮 avg_conf_kept <= 该值时允许重训")
     # ====================
 
     parser.add_argument('--lr', default=2e-4, type=float)
@@ -178,7 +210,7 @@ def get_args_parser():
 
     return parser
 
-def visualize_training_progress(model, samples, output_dir, epoch, device):
+def visualize_training_progress(model, samples, output_dir, epoch, device, pseudo_thr=0.5):
     """
     在训练过程中可视化固定的样本 (Teacher 模型效果)
     """
@@ -210,8 +242,8 @@ def visualize_training_progress(model, samples, output_dir, epoch, device):
         probs = pred_logits[idx].sigmoid()
         scores = probs.squeeze(-1)
         
-        # 可视化阈值设高一点
-        keep = scores > 0.5 
+        # 使用当前可视化阈值进行筛选
+        keep = scores > pseudo_thr
         
         valid_polys = pred_polys[idx][keep]
         valid_corners = pred_corners[idx][keep].sigmoid()
@@ -231,9 +263,10 @@ def visualize_training_progress(model, samples, output_dir, epoch, device):
                 ax.scatter(poly[is_corner, 0], poly[is_corner, 1], c='red', s=4, zorder=10)
 
         ax.axis('off')
-        ax.set_title(f"Epoch {epoch} - Teacher Pred")
+        ax.set_title(f"Epoch {epoch} - Teacher Pred (thr={pseudo_thr:.3f})")
 
-    save_path = Path(output_dir) / f"vis_epoch_{epoch:03d}.png"
+    thr_tag = f"{pseudo_thr:.3f}".replace('.', 'p')
+    save_path = Path(output_dir) / f"vis_epoch_{epoch:03d}_thr_{thr_tag}.png"
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
@@ -499,6 +532,44 @@ def main(args):
     writer = None
     if args.output_dir and utils.is_main_process():
         writer = SummaryWriter(log_dir=str(output_dir))
+        run_meta_path = output_dir / "A.txt"
+        launch_cmd = " ".join(shlex.quote(x) for x in sys.argv)
+        key_hparams = {
+            "source_path": args.source_path,
+            "target_path": args.target_path,
+            "resume": args.resume,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "lr_drop": args.lr_drop,
+            "burn_in_epochs": args.burn_in_epochs,
+            "lambda_unsup": args.lambda_unsup,
+            "lambda_mae": args.lambda_mae,
+            "retrain_force_resume": args.retrain_force_resume,
+            "retrain_stage1_epochs": args.retrain_stage1_epochs,
+            "retrain_stage1_interval": args.retrain_stage1_interval,
+            "retrain_stage2_epochs": args.retrain_stage2_epochs,
+            "retrain_stage2_interval": args.retrain_stage2_interval,
+            "retrain_stage3_interval": args.retrain_stage3_interval,
+            "pseudo_thr_init": args.pseudo_thr_init,
+            "pseudo_thr_min": args.pseudo_thr_min,
+            "pseudo_thr_max": args.pseudo_thr_max,
+            "pseudo_thr_quantile": args.pseudo_thr_quantile,
+            "pseudo_thr_target_ema_momentum": args.pseudo_thr_target_ema_momentum,
+            "pseudo_thr_source_weight": args.pseudo_thr_source_weight,
+            "pseudo_thr_target_weight": args.pseudo_thr_target_weight,
+            "pseudo_topk": args.pseudo_topk,
+            "pseudo_min_box_area": args.pseudo_min_box_area,
+        }
+        with run_meta_path.open("w", encoding="utf-8") as f:
+            f.write(f"run_start_time: {datetime.datetime.now().isoformat()}\n")
+            f.write(f"git_sha: {utils.get_sha()}\n")
+            f.write(f"cuda_visible_devices: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}\n")
+            f.write(f"launch_command: {launch_cmd}\n\n")
+            f.write("key_hyperparameters:\n")
+            f.write(json.dumps(key_hparams, ensure_ascii=False, indent=2) + "\n\n")
+            f.write("all_args:\n")
+            f.write(json.dumps(vars(args), ensure_ascii=False, indent=2) + "\n")
 
     if args.eval:
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
@@ -511,28 +582,88 @@ def main(args):
     print("Start UDA training")
     start_time = time.time()
     
-    # [MRT] 设置重训练间隔 (论文建议 10 或 40，针对你的情况建议 10)
-    RETRAIN_INTERVAL = 10
+    if args.retrain_interval > 0:
+        args.retrain_stage1_interval = args.retrain_interval
+    clean_ckpt_path = output_dir / 'theta_mask_clean.pth' if args.output_dir else None
+    prev_train_stats = None
+
+    def get_retrain_interval(stage2_epoch):
+        if stage2_epoch <= 0:
+            return 0
+        if stage2_epoch <= args.retrain_stage1_epochs:
+            return args.retrain_stage1_interval
+        if stage2_epoch <= (args.retrain_stage1_epochs + args.retrain_stage2_epochs):
+            return args.retrain_stage2_interval
+        return args.retrain_stage3_interval
     
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_source.set_epoch(epoch)
             sampler_target.set_epoch(epoch)
 
+        retrain_due = False
+        retrain_triggered = False
+        retrain_gate_pass = False
+        retrain_interval_curr = 0
+        retrain_gate_reason = "not_checked"
+        retrain_action = "not_due"
+
         # ---------------------------------------------------------------------
-        # [MRT] Selective Retraining Trigger
+        # [MRT] Selective Retraining Trigger (阶段化 + 门控)
         # 逻辑：
-        # 1. 跳过 Burn-in 阶段 (前 10 epoch 不重置，让模型先跑热)
-        # 2. 只有在特定间隔触发 (e.g., Epoch 10, 20, 30...)
+        # 1. 仅在第二阶段触发（stage2_epoch > 0）
+        # 2. 阶段化间隔：前期/中期/后期
+        # 3. 门控触发：仅当上一轮置信度质量下降时才执行重训
         # ---------------------------------------------------------------------
-        if epoch > 0 and epoch % RETRAIN_INTERVAL == 0:
-            print(f"\n⚡ Triggering Selective Retraining at Epoch {epoch} ⚡")
-            # 注意：传入 model_without_ddp 以避免 DDP 包装器的前缀问题
-            # args.resume 必须指向你的 checkpoint_crowd.pth (源域预训练权重)
-            selective_retraining(model_without_ddp, args.resume)
-            
-            # [Optional] 重置后，为了防止梯度动量(Momentum)依然指向错误的方向，
-            # 有些策略会清空优化器状态，但 AdamW 通常能自适应调整，这里暂不清除以保持训练平滑。
+        stage2_epoch = epoch - args.burn_in_epochs
+        retrain_interval_curr = get_retrain_interval(stage2_epoch)
+        schedule_due = retrain_interval_curr > 0 and stage2_epoch % retrain_interval_curr == 0
+        retrain_due = schedule_due
+
+        gate_pass = True
+        gate_reason = "gate disabled"
+        if not args.disable_retrain_gate:
+            gate_pass = False
+            gate_reason = "no previous stats"
+            if prev_train_stats is not None:
+                prev_conf_mean = float(prev_train_stats.get('pseudo_conf_mean', float('nan')))
+                prev_conf_kept = float(prev_train_stats.get('pseudo_conf_kept_mean', float('nan')))
+                low_conf = (not np.isnan(prev_conf_mean)) and (prev_conf_mean <= args.retrain_gate_conf_mean_max)
+                low_kept = (not np.isnan(prev_conf_kept)) and (prev_conf_kept <= args.retrain_gate_conf_kept_max)
+                gate_pass = low_conf or low_kept
+                gate_reason = (
+                    f"prev_avg_conf={prev_conf_mean:.4f}, prev_avg_conf_kept={prev_conf_kept:.4f}, "
+                    f"thresholds=({args.retrain_gate_conf_mean_max:.4f}, {args.retrain_gate_conf_kept_max:.4f})"
+                )
+
+        if schedule_due:
+            if gate_pass:
+                retrain_triggered = True
+                retrain_gate_pass = True
+                retrain_action = "triggered"
+                print(
+                    f"\n⚡ Triggering Selective Retraining at Epoch {epoch} "
+                    f"(stage2_epoch={stage2_epoch}, interval={retrain_interval_curr}) ⚡"
+                )
+                print(f"[RetrainGate] PASS: {gate_reason}")
+                # 注意：传入 model_without_ddp 以避免 DDP 包装器的前缀问题
+                # 优先加载 Burn-in 阶段产出的 clean 权重，避免伪标签污染
+                if args.retrain_force_resume:
+                    retrain_path = args.resume
+                else:
+                    retrain_path = str(clean_ckpt_path) if (clean_ckpt_path is not None and clean_ckpt_path.exists()) else args.resume
+                selective_retraining(model_without_ddp, retrain_path)
+            else:
+                retrain_gate_pass = False
+                retrain_action = "skipped_by_gate"
+                print(
+                    f"[RetrainGate] SKIP at Epoch {epoch} "
+                    f"(stage2_epoch={stage2_epoch}, interval={retrain_interval_curr}). {gate_reason}"
+                )
+        else:
+            retrain_gate_pass = gate_pass
+            retrain_action = "not_due"
+        retrain_gate_reason = gate_reason
         # ---------------------------------------------------------------------
 
         # 调用训练函数 (使用我们刚刚优化过的 engine.py)
@@ -548,13 +679,47 @@ def main(args):
             max_norm=args.clip_max_norm,
             args=args 
         )
+        prev_train_stats = train_stats
+        epoch_pseudo_conf_mean = float(train_stats.get('pseudo_conf_mean', float('nan')))
+        epoch_pseudo_conf_kept_mean = float(train_stats.get('pseudo_conf_kept_mean', float('nan')))
+        raw_pseudo_thr = float(train_stats.get('pseudo_thr_raw_mean', float('nan')))
+        effective_pseudo_thr = float(train_stats.get('pseudo_thr_effective_mean', float('nan')))
+        target_ema_pseudo_thr = float(train_stats.get('pseudo_thr_target_ema_mean', float('nan')))
+        quantile_pseudo_thr = float(train_stats.get('pseudo_thr_quantile_mean', float('nan')))
+
+        print(
+            f"[PseudoThr][Epoch {epoch}] raw={raw_pseudo_thr:.6f}, "
+            f"target_ema={target_ema_pseudo_thr:.6f}, q_thr={quantile_pseudo_thr:.6f}, "
+            f"effective={effective_pseudo_thr:.6f}, avg_conf={epoch_pseudo_conf_mean:.6f}, "
+            f"avg_conf_kept={epoch_pseudo_conf_kept_mean:.6f}"
+        )
+
+        # Burn-in 结束：保存 clean 权重，并将 Teacher 与 clean Student 对齐
+        if args.output_dir and epoch == (args.burn_in_epochs - 1):
+            print(f"\n💾 Saving clean burn-in weights to {clean_ckpt_path}")
+            utils.save_on_master({
+                'model': model_without_ddp.state_dict(),
+                'epoch': epoch,
+                'args': args,
+                'tag': 'theta_mask_clean'
+            }, clean_ckpt_path)
+            teacher_model.load_state_dict(model_without_ddp.state_dict(), strict=False)
+            print("✅ Teacher synced from theta_mask_clean.")
         
         lr_scheduler.step()
 
         # 可视化 (使用 Teacher 模型查看伪标签效果)
         if args.output_dir and vis_samples is not None and utils.is_main_process():
             try:
-                visualize_training_progress(teacher_model, vis_samples, args.output_dir, epoch, device)
+                vis_pseudo_thr = effective_pseudo_thr if not np.isnan(effective_pseudo_thr) else 0.5
+                visualize_training_progress(
+                    teacher_model,
+                    vis_samples,
+                    args.output_dir,
+                    epoch,
+                    device,
+                    pseudo_thr=vis_pseudo_thr,
+                )
             except Exception as e:
                 print(f"Vis failed: {e}")
 
@@ -625,12 +790,47 @@ def main(args):
                      'target_bbox_mAP': target_bbox_ap,
                      'target_bbox_AP50': target_bbox_ap50,
                      'target_bbox_AP75': target_bbox_ap75,
+                     'retrain_due': retrain_due,
+                     'retrain_triggered': retrain_triggered,
+                     'retrain_stage2_epoch': stage2_epoch,
+                     'retrain_interval_curr': retrain_interval_curr,
+                     'retrain_gate_pass': retrain_gate_pass,
+                     'retrain_action': retrain_action,
+                     'retrain_gate_reason': retrain_gate_reason,
+                     'pseudo_thr_raw': raw_pseudo_thr,
+                     'pseudo_thr_target_ema': target_ema_pseudo_thr,
+                     'pseudo_thr_quantile': quantile_pseudo_thr,
+                     'pseudo_thr_effective': effective_pseudo_thr,
                      'epoch': epoch,
                      'n_parameters': n_parameters}
 
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+
+            with (output_dir / "pseudo_threshold_log.txt").open("a") as f:
+                if f.tell() == 0:
+                    f.write(
+                        "epoch(轮次)\traw_threshold(源域动态阈值)\ttarget_ema_threshold(目标域EMA阈值)"
+                        "\tquantile_threshold(目标域分位数阈值)\teffective_threshold(生效阈值)"
+                        "\tavg_confidence(平均置信度)\tavg_confidence_kept(保留伪标签平均置信度)"
+                        "\tretrain_due(是否到重训周期)\tretrain_triggered(是否实际重训)"
+                        "\tretrain_stage2_epoch(第二阶段轮次)\tretrain_interval(当前阶段重训间隔)"
+                        "\tretrain_gate_pass(门控是否通过)\tretrain_action(重训动作)"
+                        "\tretrain_gate_reason(门控原因)\n"
+                    )
+                raw_str = f"{raw_pseudo_thr:.6f}"
+                tgt_ema_str = f"{target_ema_pseudo_thr:.6f}"
+                q_str = f"{quantile_pseudo_thr:.6f}"
+                eff_str = f"{effective_pseudo_thr:.6f}"
+                conf_str = f"{epoch_pseudo_conf_mean:.6f}"
+                conf_kept_str = f"{epoch_pseudo_conf_kept_mean:.6f}"
+                gate_reason_sanitized = str(retrain_gate_reason).replace('\t', ' ').replace('\n', ' ')
+                f.write(
+                    f"{epoch}\t{raw_str}\t{tgt_ema_str}\t{q_str}\t{eff_str}\t{conf_str}\t{conf_kept_str}"
+                    f"\t{int(retrain_due)}\t{int(retrain_triggered)}\t{stage2_epoch}\t{retrain_interval_curr}"
+                    f"\t{int(retrain_gate_pass)}\t{retrain_action}\t{gate_reason_sanitized}\n"
+                )
             
             if writer is not None:
                 for k, v in log_stats.items():

@@ -257,10 +257,40 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
     tgt_samples, _ = prefetcher_tgt.next()
 
     iter_per_epoch = min(len(data_loader_source), len(data_loader_target))
+    pseudo_conf_sum = 0.0
+    pseudo_conf_count = 0
+    pseudo_conf_kept_sum = 0.0
+    pseudo_conf_kept_count = 0
+    pseudo_thr_raw_sum = 0.0
+    pseudo_thr_effective_sum = 0.0
+    pseudo_thr_target_ema_sum = 0.0
+    pseudo_thr_quantile_sum = 0.0
+    pseudo_thr_count = 0
+
+    thr_quantile = float(getattr(args, 'pseudo_thr_quantile', 0.94))
+    thr_quantile = min(0.99, max(0.5, thr_quantile))
+    thr_ema_momentum = float(getattr(args, 'pseudo_thr_target_ema_momentum', 0.95))
+    thr_ema_momentum = min(0.999, max(0.0, thr_ema_momentum))
+    thr_min = float(getattr(args, 'pseudo_thr_min', 0.30))
+    thr_max = float(getattr(args, 'pseudo_thr_max', 0.60))
+    if thr_max < thr_min:
+        thr_max = thr_min
+    source_w = float(getattr(args, 'pseudo_thr_source_weight', 0.20))
+    target_w = float(getattr(args, 'pseudo_thr_target_weight', 0.80))
+    w_sum = source_w + target_w
+    if w_sum <= 1e-12:
+        source_w, target_w = 0.5, 0.5
+        w_sum = 1.0
+    source_w /= w_sum
+    target_w /= w_sum
+
+    if not hasattr(criterion, 'pseudo_target_thr_ema'):
+        init_thr = float(getattr(args, 'pseudo_thr_init', 0.34))
+        criterion.pseudo_target_thr_ema = min(thr_max, max(thr_min, init_thr))
     
     # === [MRT Strategy] Burn-in Period ===
-    # 前 10 个 epoch 只做 Source + MAE，完全忽略 Teacher 伪标签
-    burn_in_epochs = 5
+    # 前若干 epoch 只做 Source + MAE，完全忽略 Teacher 伪标签
+    burn_in_epochs = getattr(args, 'burn_in_epochs', 5)
     is_burn_in = epoch < burn_in_epochs
     
     for _ in metric_logger.log_every(range(iter_per_epoch), print_freq, header):
@@ -273,7 +303,7 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
         else:
             # Burn-in 后，缓慢增加权重 (Ramp-up)
             # 例如 10-20 epoch 从 0 线性增加到 target_lambda
-            ramp_epochs = 30
+            ramp_epochs = 80
             progress = min(1.0, max(0.0, epoch - burn_in_epochs) / ramp_epochs)
             lambda_unsup = args.lambda_unsup * progress
             
@@ -295,9 +325,8 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
             corner_thresh = getattr(args, 'pseudo_corner_thresh', 0.45)
             corner_nms_thresh = getattr(args, 'pseudo_corner_nms_thresh', 10.0)
             enable_corner_nms = not getattr(args, 'disable_pseudo_corner_nms', False)
-            pseudo_thr_floor = getattr(args, 'pseudo_thr_floor', 0.28)
-            pseudo_min_box_area = getattr(args, 'pseudo_min_box_area', 0.001)
-            pseudo_topk = getattr(args, 'pseudo_topk', 80)
+            pseudo_min_box_area = getattr(args, 'pseudo_min_box_area', 0.004)
+            pseudo_topk = getattr(args, 'pseudo_topk', 25)
             
             with torch.no_grad():
                 teacher_output = teacher(tgt_samples)
@@ -314,15 +343,35 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
 
                 probs = teacher_logits.sigmoid()
                 top_scores, top_labels = probs.max(dim=-1)
+                pseudo_conf_sum += top_scores.sum().item()
+                pseudo_conf_count += top_scores.numel()
+
+                if top_scores.numel() > 0:
+                    q_thr = torch.quantile(top_scores.reshape(-1), thr_quantile).item()
+                else:
+                    q_thr = criterion.pseudo_target_thr_ema
+                target_ema = thr_ema_momentum * criterion.pseudo_target_thr_ema + (1.0 - thr_ema_momentum) * q_thr
+                target_ema = min(thr_max, max(thr_min, target_ema))
+                criterion.pseudo_target_thr_ema = target_ema
+
+                raw_thr = float(criterion.dynamic_threshold.get_threshold(0))
+                fused_thr = source_w * raw_thr + target_w * target_ema
+                effective_thr = min(thr_max, max(thr_min, fused_thr))
 
                 for i in range(len(top_scores)):
-                    # [MRT] 获取 Source-Guided 动态阈值
-                    thr = criterion.dynamic_threshold.get_threshold(0)
-                    # 放宽下限，增加目标域伪标签覆盖
-                    thr = max(thr, pseudo_thr_floor)
+                    thr = effective_thr
+                    pseudo_thr_raw_sum += raw_thr
+                    pseudo_thr_effective_sum += effective_thr
+                    pseudo_thr_target_ema_sum += target_ema
+                    pseudo_thr_quantile_sum += q_thr
+                    pseudo_thr_count += 1
                     
                     # 3.1 初步筛选
                     keep_idxs = torch.where(top_scores[i] > thr)[0]
+                    if keep_idxs.numel() > 0:
+                        kept_scores = top_scores[i][keep_idxs]
+                        pseudo_conf_kept_sum += kept_scores.sum().item()
+                        pseudo_conf_kept_count += kept_scores.numel()
                     
                     if len(keep_idxs) == 0:
                         # Append empty
@@ -486,9 +535,11 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
         optimizer.step()
 
         # 6. Update Teacher & Threshold
-        update_teacher(student, teacher)
-        # [MRT] 使用 Source 预测结果来更新阈值，而不是 Target
-        criterion.dynamic_threshold.update(src_outputs['pred_logits'], [t['labels'] for t in src_targets])
+        # Burn-in 阶段冻结 Teacher，避免把伪标签噪声或未稳定表征注入 Teacher
+        if not is_burn_in:
+            update_teacher(student, teacher)
+            # [MRT] 使用 Source 预测结果来更新阈值，而不是 Target
+            criterion.dynamic_threshold.update(src_outputs['pred_logits'], [t['labels'] for t in src_targets])
 
         metric_logger.update(loss=total_loss_val)
         metric_logger.update(loss_sup=losses_sup.item())
@@ -510,7 +561,14 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats['pseudo_conf_mean'] = (pseudo_conf_sum / pseudo_conf_count) if pseudo_conf_count > 0 else float('nan')
+    stats['pseudo_conf_kept_mean'] = (pseudo_conf_kept_sum / pseudo_conf_kept_count) if pseudo_conf_kept_count > 0 else float('nan')
+    stats['pseudo_thr_raw_mean'] = (pseudo_thr_raw_sum / pseudo_thr_count) if pseudo_thr_count > 0 else float('nan')
+    stats['pseudo_thr_effective_mean'] = (pseudo_thr_effective_sum / pseudo_thr_count) if pseudo_thr_count > 0 else float('nan')
+    stats['pseudo_thr_target_ema_mean'] = (pseudo_thr_target_ema_sum / pseudo_thr_count) if pseudo_thr_count > 0 else float('nan')
+    stats['pseudo_thr_quantile_mean'] = (pseudo_thr_quantile_sum / pseudo_thr_count) if pseudo_thr_count > 0 else float('nan')
+    return stats
 
 @torch.no_grad()
 def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir):

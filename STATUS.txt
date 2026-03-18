@@ -3,3 +3,6 @@
 myuda文件夹中：
 CUDA_VISIBLE_DEVICES=1 python  main.py     --source_path "/data/zfx/datasets/CrowdAI"     --target_path "/data/zfx/datasets/WHUuda/"     --output_dir "/data/zfx/myuda/uda_whu_run_v5"     --resume "/data/zfx/myuda/uda_whu_run_v5/checkpoint.pth"     --use_mae     --mask_ratio 0.75     --lambda_unsup 0.5     --lambda_mae 1.0     --epochs 50     --lr 1e-4     --lr_drop 40     --batch_size 2     --num_workers 1     --num_queries 300     --with_box_refine     --num_feature_levels 4     --poly_coord_loss_coef 5.0     --poly_corner_loss_coef 1.0     --focal_alpha 0.25
 续接之前没跑完的uda（带重训练，但还需要继续看结果优化调整）
+
+增加了MAE分支权重，重训加载这个权重
+CUDA_VISIBLE_DEVICES=0 python  main.py     --source_path "/data/zfx/datasets/CrowdAI"     --target_path "/data/zfx/datasets/LovaDA/Train/Urban/images_png"     --output_dir "/data/zfx/myuda/uda_loveDA_run_v6"     --resume weight/checkpoint_crowd.pth --burn_in_epochs 40 --retrain_interval 20  --use_mae     --mask_ratio 0.75     --lambda_unsup 0.5     --lambda_mae 1.0     --epochs 200     --lr 1e-4     --lr_drop 80     --batch_size 2     --num_workers 1     --num_queries 300     --with_box_refine     --num_feature_levels 4     --poly_coord_loss_coef 5.0     --poly_corner_loss_coef 1.0     --focal_alpha 0.25
