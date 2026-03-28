@@ -122,8 +122,112 @@ def apply_nms(poly, corner_scores, corner_thresh, dist_thresh):
     mask[keep_indices] = True
     return mask
 
+def _segments_intersect(p1, p2, q1, q2):
+    def orient(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 
-def visualize_image(model, img_path, transform, device, save_dir, score_thresh=0.5, corner_thresh=0.5, only_corner=False, enable_nms=False, nms_thresh=10.0):
+    def on_segment(a, b, c):
+        return min(a[0], b[0]) <= c[0] <= max(a[0], b[0]) and min(a[1], b[1]) <= c[1] <= max(a[1], b[1])
+
+    o1 = orient(p1, p2, q1)
+    o2 = orient(p1, p2, q2)
+    o3 = orient(q1, q2, p1)
+    o4 = orient(q1, q2, p2)
+    if (o1 * o2 < 0) and (o3 * o4 < 0):
+        return True
+    if o1 == 0 and on_segment(p1, p2, q1):
+        return True
+    if o2 == 0 and on_segment(p1, p2, q2):
+        return True
+    if o3 == 0 and on_segment(q1, q2, p1):
+        return True
+    if o4 == 0 and on_segment(q1, q2, p2):
+        return True
+    return False
+
+def has_self_intersection(poly):
+    n = len(poly)
+    if n < 4:
+        return False
+    for i in range(n):
+        a1 = poly[i]
+        a2 = poly[(i + 1) % n]
+        for j in range(i + 1, n):
+            if abs(i - j) <= 1 or (i == 0 and j == n - 1):
+                continue
+            b1 = poly[j]
+            b2 = poly[(j + 1) % n]
+            if _segments_intersect(a1, a2, b1, b2):
+                return True
+    return False
+
+def repair_polygon_self_intersection(poly):
+    if poly.shape[0] < 4:
+        return poly
+    if not has_self_intersection(poly):
+        return poly
+    center = np.mean(poly, axis=0, keepdims=True)
+    vec = poly - center
+    ang = np.arctan2(vec[:, 1], vec[:, 0])
+    order = np.argsort(ang)
+    return poly[order]
+
+def polygon_iou_raster(poly_a, poly_b, img_h, img_w, downsample=4):
+    ds = max(1, int(downsample))
+    h = max(8, img_h // ds)
+    w = max(8, img_w // ds)
+    scale_x = w / max(1.0, float(img_w))
+    scale_y = h / max(1.0, float(img_h))
+
+    pa = poly_a.copy()
+    pb = poly_b.copy()
+    pa[:, 0] *= scale_x
+    pa[:, 1] *= scale_y
+    pb[:, 0] *= scale_x
+    pb[:, 1] *= scale_y
+
+    ma = np.zeros((h, w), dtype=np.uint8)
+    mb = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(ma, [pa.astype(np.int32)], 1)
+    cv2.fillPoly(mb, [pb.astype(np.int32)], 1)
+    inter = np.logical_and(ma, mb).sum()
+    union = np.logical_or(ma, mb).sum()
+    if union == 0:
+        return 0.0
+    return float(inter / union)
+
+def polygon_nms_indices(polys, scores, img_h, img_w, iou_thresh=0.3, downsample=4):
+    if len(polys) == 0:
+        return []
+    order = np.argsort(np.asarray(scores))[::-1]
+    keep = []
+    for idx in order:
+        keep_flag = True
+        for kept_idx in keep:
+            if polygon_iou_raster(polys[idx], polys[kept_idx], img_h, img_w, downsample=downsample) >= iou_thresh:
+                keep_flag = False
+                break
+        if keep_flag:
+            keep.append(int(idx))
+    return keep
+
+
+def visualize_image(
+    model,
+    img_path,
+    transform,
+    device,
+    save_dir,
+    score_thresh=0.5,
+    corner_thresh=0.5,
+    only_corner=False,
+    enable_nms=False,
+    nms_thresh=10.0,
+    enable_polygon_nms=True,
+    polygon_nms_iou=0.3,
+    polygon_nms_downsample=4,
+    repair_self_intersection=True,
+):
     img = Image.open(img_path).convert("RGB")
     w, h = img.size
     img_t, _ = transform(img, None)
@@ -160,9 +264,39 @@ def visualize_image(model, img_path, transform, device, save_dir, score_thresh=0
     keep = scores > score_thresh
     polys = pred_polys[keep].cpu().numpy()
     corners = pred_corners[keep].cpu().numpy()
+    det_scores = scores[keep].cpu().numpy()
 
     polys[..., 0] *= w
     polys[..., 1] *= h
+
+    draw_polys = []
+    draw_corners = []
+    draw_scores = []
+    for poly, corner, det_score in zip(polys, corners, det_scores):
+        is_corner = apply_nms(poly, corner, corner_thresh, nms_thresh) if enable_nms else (corner > corner_thresh)
+        if only_corner and is_corner.sum() >= 3:
+            draw_poly = poly[is_corner]
+        else:
+            draw_poly = poly
+        if repair_self_intersection:
+            draw_poly = repair_polygon_self_intersection(draw_poly)
+        if draw_poly.shape[0] < 3:
+            continue
+        draw_polys.append(draw_poly)
+        draw_corners.append((poly, is_corner))
+        draw_scores.append(float(det_score))
+
+    if enable_polygon_nms and len(draw_polys) > 1:
+        keep_idx = polygon_nms_indices(
+            draw_polys,
+            draw_scores,
+            h,
+            w,
+            iou_thresh=polygon_nms_iou,
+            downsample=polygon_nms_downsample,
+        )
+        draw_polys = [draw_polys[i] for i in keep_idx]
+        draw_corners = [draw_corners[i] for i in keep_idx]
 
     # [优化] 使用 OpenCV 进行绘图，显著提升速度
     # Convert PIL to BGR for OpenCV
@@ -170,18 +304,8 @@ def visualize_image(model, img_path, transform, device, save_dir, score_thresh=0
     img_cv2 = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
     overlay = img_cv2.copy()
 
-    for poly, corner in zip(polys, corners):
-        if enable_nms:
-            is_corner = apply_nms(poly, corner, corner_thresh, nms_thresh)
-        else:
-            is_corner = corner > corner_thresh
-
-        # 1. 确定多边形轮廓点
-        if only_corner and is_corner.sum() >= 3:
-            draw_poly = poly[is_corner]
-        else:
-            draw_poly = poly
-        
+    for draw_poly, corner_pack in zip(draw_polys, draw_corners):
+        poly, is_corner = corner_pack
         # 转换为 int32 用于 cv2 绘图
         pts = draw_poly.astype(np.int32).reshape((-1, 1, 2))
 
@@ -231,6 +355,10 @@ def main():
     parser.add_argument("--onlycorner", action="store_true", help="Only draw polygon formed by corner points")
     parser.add_argument("--enable_nms", action="store_true", help="Enable NMS for corner points")
     parser.add_argument("--nms_thresh", type=float, default=10.0, help="NMS distance threshold in pixels")
+    parser.add_argument("--disable_polygon_nms", action="store_true", help="Disable polygon NMS between instances")
+    parser.add_argument("--polygon_nms_iou", type=float, default=0.3, help="Polygon NMS IoU threshold")
+    parser.add_argument("--polygon_nms_downsample", type=int, default=4, help="Downsample factor for polygon IoU rasterization")
+    parser.add_argument("--disable_self_intersection_repair", action="store_true", help="Disable polygon self-intersection repair")
 
 
     args = parser.parse_args()
@@ -260,6 +388,10 @@ def main():
             args.onlycorner,
             args.enable_nms,
             args.nms_thresh,
+            enable_polygon_nms=not args.disable_polygon_nms,
+            polygon_nms_iou=args.polygon_nms_iou,
+            polygon_nms_downsample=args.polygon_nms_downsample,
+            repair_self_intersection=not args.disable_self_intersection_repair,
         )
 
 

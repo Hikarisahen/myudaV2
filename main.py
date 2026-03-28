@@ -61,9 +61,9 @@ CUSTOM_VIS_IMAGE_PATHS = [
     # "/data/zfx/datasets/GoogleMap/train/images/target_domain_000237.jpg",  
     # GoogleMap
     "/data/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
-    "/data/zfx/datasets/LovaDA/Train/Urban/images_png/2147.png",  # 简单大型建筑物
-    "/data/zfx/datasets/LovaDA/Train/Urban/images_png/1474.png",  # 稍复杂小建筑物
-    "/data/zfx/datasets/LovaDA/Train/Urban/images_png/1630.png",  # 复杂立体建筑物
+    "/data/zfx/datasets/LoveDA/Train/Urban/images_png/2147.png",  # 简单大型建筑物
+    "/data/zfx/datasets/LoveDA/Train/Urban/images_png/1474.png",  # 稍复杂小建筑物
+    "/data/zfx/datasets/LoveDA/Train/Urban/images_png/1630.png",  # 复杂立体建筑物
 ]
 
 def get_args_parser():
@@ -80,7 +80,7 @@ def get_args_parser():
     parser.add_argument('--pseudo_corner_nms_thresh', default=10.0, type=float, help="教师伪标签角点NMS距离阈值（像素）")
     parser.add_argument('--disable_pseudo_corner_nms', action='store_true', help="构建教师伪标签时禁用角点NMS")
     parser.add_argument('--pseudo_thr_init', default=0.34, type=float, help="自适应伪标签阈值EMA初始值")
-    parser.add_argument('--pseudo_thr_min', default=0.30, type=float, help="自适应伪标签阈值最小值")
+    parser.add_argument('--pseudo_thr_min', default=0.35, type=float, help="自适应伪标签阈值最小值")
     parser.add_argument('--pseudo_thr_max', default=0.60, type=float, help="自适应伪标签阈值最大值")
     parser.add_argument('--pseudo_thr_quantile', default=0.94, type=float, help="目标域置信度分位数，用于估计目标阈值")
     parser.add_argument('--pseudo_thr_target_ema_momentum', default=0.95, type=float, help="目标域分位数阈值EMA动量")
@@ -88,13 +88,17 @@ def get_args_parser():
     parser.add_argument('--pseudo_thr_target_weight', default=0.80, type=float, help="融合阈值中target分位数EMA权重")
     parser.add_argument('--pseudo_topk', default=25, type=int, help="每张图最多保留的伪标签数量")
     parser.add_argument('--pseudo_min_box_area', default=0.004, type=float, help="伪标签最小框面积（归一化wh面积）")
+    parser.add_argument('--disable_pseudo_polygon_nms', action='store_true', help="构建教师伪标签时禁用多边形NMS")
+    parser.add_argument('--pseudo_polygon_nms_iou', default=0.30, type=float, help="教师伪标签多边形NMS的IoU阈值")
+    parser.add_argument('--pseudo_polygon_nms_downsample', default=4, type=int, help="多边形IoU栅格化降采样倍率")
+    parser.add_argument('--disable_pseudo_self_intersection_repair', action='store_true', help="构建教师伪标签时禁用多边形自交修复")
     parser.add_argument('--burn_in_epochs', default=5, type=int,
                         help="Burn-in epochs: train with Source supervision + Target MAE only")
     parser.add_argument('--retrain_interval', default=0, type=int,
                         help="[兼容旧参数] 若>0则覆盖阶段1重训间隔")
     parser.add_argument('--retrain_stage1_epochs', default=60, type=int,
                         help="第二阶段前期长度（按 stage2_epoch 计）")
-    parser.add_argument('--retrain_stage1_interval', default=10, type=int,
+    parser.add_argument('--retrain_stage1_interval', default=15, type=int,
                         help="第二阶段前期重训间隔")
     parser.add_argument('--retrain_stage2_epochs', default=60, type=int,
                         help="第二阶段中期长度（按 stage2_epoch 计）")
@@ -110,6 +114,16 @@ def get_args_parser():
                         help="门控阈值：上一轮 avg_conf <= 该值时允许重训")
     parser.add_argument('--retrain_gate_conf_kept_max', default=0.55, type=float,
                         help="门控阈值：上一轮 avg_conf_kept <= 该值时允许重训")
+    parser.add_argument('--disable_retrain_event_trigger', action='store_true',
+                        help="禁用重训事件触发（仅按阶段周期触发）")
+    parser.add_argument('--retrain_event_conf_drop', default=0.02, type=float,
+                        help="事件触发阈值：avg_conf 单轮下降超过该值时触发")
+    parser.add_argument('--retrain_event_kept_drop', default=0.03, type=float,
+                        help="事件触发阈值：avg_conf_kept 单轮下降超过该值时触发")
+    parser.add_argument('--retrain_event_thr_drop', default=0.025, type=float,
+                        help="事件触发阈值：effective_threshold 单轮下降超过该值时触发")
+    parser.add_argument('--retrain_cooldown_epochs', default=6, type=int,
+                        help="两次重训之间的最小冷却epoch数")
     # ====================
 
     parser.add_argument('--lr', default=2e-4, type=float)
@@ -585,7 +599,11 @@ def main(args):
     if args.retrain_interval > 0:
         args.retrain_stage1_interval = args.retrain_interval
     clean_ckpt_path = output_dir / 'theta_mask_clean.pth' if args.output_dir else None
+    best_ckpt_path = output_dir / 'checkpoint_target_best.pth' if args.output_dir else None
     prev_train_stats = None
+    prev_prev_train_stats = None
+    last_retrain_epoch = -10**9
+    max_avg_confidence_kept = 0.0
 
     def get_retrain_interval(stage2_epoch):
         if stage2_epoch <= 0:
@@ -602,6 +620,9 @@ def main(args):
             sampler_target.set_epoch(epoch)
 
         retrain_due = False
+        retrain_schedule_due = False
+        retrain_event_due = False
+        retrain_cooldown_ok = True
         retrain_triggered = False
         retrain_gate_pass = False
         retrain_interval_curr = 0
@@ -618,7 +639,26 @@ def main(args):
         stage2_epoch = epoch - args.burn_in_epochs
         retrain_interval_curr = get_retrain_interval(stage2_epoch)
         schedule_due = retrain_interval_curr > 0 and stage2_epoch % retrain_interval_curr == 0
-        retrain_due = schedule_due
+        retrain_schedule_due = schedule_due
+
+        event_due = False
+        event_reason = "no_event"
+        if not args.disable_retrain_event_trigger and max_avg_confidence_kept > 0.0 and prev_train_stats is not None:
+            prev_kept = float(prev_train_stats.get('pseudo_conf_kept_mean', float('nan')))
+            
+            # 使用历史最高点计算回撤
+            if not np.isnan(prev_kept):
+                kept_drop = max_avg_confidence_kept - prev_kept
+                if kept_drop >= args.retrain_event_kept_drop:
+                    event_due = True
+                    event_reason = (
+                        f"event_drop(max_kept={max_avg_confidence_kept:.4f}, curr_kept={prev_kept:.4f}, "
+                        f"drop={kept_drop:.4f} >= {args.retrain_event_kept_drop:.4f})"
+                    )
+
+        retrain_event_due = event_due
+        retrain_cooldown_ok = (epoch - last_retrain_epoch) >= args.retrain_cooldown_epochs
+        retrain_due = schedule_due or event_due
 
         gate_pass = True
         gate_reason = "gate disabled"
@@ -627,7 +667,7 @@ def main(args):
             gate_reason = "no previous stats"
             if prev_train_stats is not None:
                 prev_conf_mean = float(prev_train_stats.get('pseudo_conf_mean', float('nan')))
-                prev_conf_kept = float(prev_train_stats.get('pseudo_conf_kept_mean', float('nan')))
+                prev_conf_kept = float(prev_train_stats.get('pseudo_conf_kept', float('nan')))
                 low_conf = (not np.isnan(prev_conf_mean)) and (prev_conf_mean <= args.retrain_gate_conf_mean_max)
                 low_kept = (not np.isnan(prev_conf_kept)) and (prev_conf_kept <= args.retrain_gate_conf_kept_max)
                 gate_pass = low_conf or low_kept
@@ -636,8 +676,35 @@ def main(args):
                     f"thresholds=({args.retrain_gate_conf_mean_max:.4f}, {args.retrain_gate_conf_kept_max:.4f})"
                 )
 
-        if schedule_due:
-            if gate_pass:
+        if retrain_due:
+            if not retrain_cooldown_ok:
+                retrain_gate_pass = False
+                retrain_action = "skipped_by_cooldown"
+                retrain_gate_reason = f"cooldown_active(last_retrain_epoch={last_retrain_epoch}, cooldown={args.retrain_cooldown_epochs})"
+                print(
+                    f"[Retrain] SKIP at Epoch {epoch} due to cooldown. "
+                    f"last={last_retrain_epoch}, cooldown={args.retrain_cooldown_epochs}"
+                )
+            elif event_due:
+                retrain_triggered = True
+                retrain_gate_pass = True
+                retrain_action = "triggered"
+                print(
+                    f"\n⚡ Triggering Selective Retraining at Epoch {epoch} "
+                    f"(event-based, stage2_epoch={stage2_epoch}) ⚡"
+                )
+                print(f"[RetrainEvent] {event_reason}")
+                if args.retrain_force_resume:
+                    retrain_path = args.resume
+                else:
+                    if best_ckpt_path is not None and best_ckpt_path.exists():
+                        retrain_path = str(best_ckpt_path)
+                    else:
+                        retrain_path = str(clean_ckpt_path) if (clean_ckpt_path is not None and clean_ckpt_path.exists()) else args.resume
+                print(f"[Fallback] Using checkpoint: {retrain_path}")
+                selective_retraining(model_without_ddp, retrain_path)
+                last_retrain_epoch = epoch
+            elif gate_pass:
                 retrain_triggered = True
                 retrain_gate_pass = True
                 retrain_action = "triggered"
@@ -647,12 +714,17 @@ def main(args):
                 )
                 print(f"[RetrainGate] PASS: {gate_reason}")
                 # 注意：传入 model_without_ddp 以避免 DDP 包装器的前缀问题
-                # 优先加载 Burn-in 阶段产出的 clean 权重，避免伪标签污染
+                # 优先加载 Best Model，如果没有才用 Burn-in 阶段产出的 clean 权重
                 if args.retrain_force_resume:
                     retrain_path = args.resume
                 else:
-                    retrain_path = str(clean_ckpt_path) if (clean_ckpt_path is not None and clean_ckpt_path.exists()) else args.resume
+                    if best_ckpt_path is not None and best_ckpt_path.exists():
+                        retrain_path = str(best_ckpt_path)
+                    else:
+                        retrain_path = str(clean_ckpt_path) if (clean_ckpt_path is not None and clean_ckpt_path.exists()) else args.resume
+                print(f"[Fallback] Using checkpoint: {retrain_path}")
                 selective_retraining(model_without_ddp, retrain_path)
+                last_retrain_epoch = epoch
             else:
                 retrain_gate_pass = False
                 retrain_action = "skipped_by_gate"
@@ -663,7 +735,9 @@ def main(args):
         else:
             retrain_gate_pass = gate_pass
             retrain_action = "not_due"
-        retrain_gate_reason = gate_reason
+            retrain_gate_reason = gate_reason
+        if retrain_action not in {"triggered_by_event", "skipped_by_cooldown"}:
+            retrain_gate_reason = gate_reason
         # ---------------------------------------------------------------------
 
         # 调用训练函数 (使用我们刚刚优化过的 engine.py)
@@ -679,6 +753,7 @@ def main(args):
             max_norm=args.clip_max_norm,
             args=args 
         )
+        prev_prev_train_stats = prev_train_stats
         prev_train_stats = train_stats
         epoch_pseudo_conf_mean = float(train_stats.get('pseudo_conf_mean', float('nan')))
         epoch_pseudo_conf_kept_mean = float(train_stats.get('pseudo_conf_kept_mean', float('nan')))
@@ -686,6 +761,22 @@ def main(args):
         effective_pseudo_thr = float(train_stats.get('pseudo_thr_effective_mean', float('nan')))
         target_ema_pseudo_thr = float(train_stats.get('pseudo_thr_target_ema_mean', float('nan')))
         quantile_pseudo_thr = float(train_stats.get('pseudo_thr_quantile_mean', float('nan')))
+
+        # =====================================================================
+        # [新增] 动态保存 Target 域历史最佳权重 (依据 pseudo_conf_kept_mean)
+        # =====================================================================
+        if epoch_pseudo_conf_kept_mean and not np.isnan(epoch_pseudo_conf_kept_mean):
+            if epoch_pseudo_conf_kept_mean > max_avg_confidence_kept:
+                max_avg_confidence_kept = epoch_pseudo_conf_kept_mean
+                if args.output_dir and utils.is_main_process() and best_ckpt_path is not None:
+                    print(f"🌟 [New Best Target Model] conf_kept reached {max_avg_confidence_kept:.6f}. Saving to {best_ckpt_path}")
+                    utils.save_on_master({
+                        'model': model_without_ddp.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'epoch': epoch,
+                        'args': args,
+                    }, best_ckpt_path)
 
         print(
             f"[PseudoThr][Epoch {epoch}] raw={raw_pseudo_thr:.6f}, "
@@ -791,6 +882,9 @@ def main(args):
                      'target_bbox_AP50': target_bbox_ap50,
                      'target_bbox_AP75': target_bbox_ap75,
                      'retrain_due': retrain_due,
+                     'retrain_schedule_due': retrain_schedule_due,
+                     'retrain_event_due': retrain_event_due,
+                     'retrain_cooldown_ok': retrain_cooldown_ok,
                      'retrain_triggered': retrain_triggered,
                      'retrain_stage2_epoch': stage2_epoch,
                      'retrain_interval_curr': retrain_interval_curr,
@@ -814,7 +908,9 @@ def main(args):
                         "epoch(轮次)\traw_threshold(源域动态阈值)\ttarget_ema_threshold(目标域EMA阈值)"
                         "\tquantile_threshold(目标域分位数阈值)\teffective_threshold(生效阈值)"
                         "\tavg_confidence(平均置信度)\tavg_confidence_kept(保留伪标签平均置信度)"
-                        "\tretrain_due(是否到重训周期)\tretrain_triggered(是否实际重训)"
+                        "\tretrain_due(是否触发重训检查)\tretrain_schedule_due(是否周期触发)"
+                        "\tretrain_event_due(是否事件触发)\tretrain_cooldown_ok(是否通过冷却)"
+                        "\tretrain_triggered(是否实际重训)"
                         "\tretrain_stage2_epoch(第二阶段轮次)\tretrain_interval(当前阶段重训间隔)"
                         "\tretrain_gate_pass(门控是否通过)\tretrain_action(重训动作)"
                         "\tretrain_gate_reason(门控原因)\n"
@@ -828,7 +924,8 @@ def main(args):
                 gate_reason_sanitized = str(retrain_gate_reason).replace('\t', ' ').replace('\n', ' ')
                 f.write(
                     f"{epoch}\t{raw_str}\t{tgt_ema_str}\t{q_str}\t{eff_str}\t{conf_str}\t{conf_kept_str}"
-                    f"\t{int(retrain_due)}\t{int(retrain_triggered)}\t{stage2_epoch}\t{retrain_interval_curr}"
+                    f"\t{int(retrain_due)}\t{int(retrain_schedule_due)}\t{int(retrain_event_due)}\t{int(retrain_cooldown_ok)}"
+                    f"\t{int(retrain_triggered)}\t{stage2_epoch}\t{retrain_interval_curr}"
                     f"\t{int(retrain_gate_pass)}\t{retrain_action}\t{gate_reason_sanitized}\n"
                 )
             

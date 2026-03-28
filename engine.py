@@ -17,6 +17,7 @@ import gc
 import numpy as np
 import torch
 import torch.nn.functional as F
+import cv2
 import torchvision.ops as ops # [新增] 用于 Box NMS
 import util.misc as utils
 from util.box_ops import box_cxcywh_to_xyxy
@@ -173,6 +174,100 @@ def apply_corner_nms(poly: np.ndarray, corner_scores: np.ndarray, corner_thresh:
     mask[keep_indices] = True
     return mask
 
+def _segments_intersect(p1, p2, q1, q2) -> bool:
+    def orient(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    def on_segment(a, b, c):
+        return min(a[0], b[0]) <= c[0] <= max(a[0], b[0]) and min(a[1], b[1]) <= c[1] <= max(a[1], b[1])
+
+    o1 = orient(p1, p2, q1)
+    o2 = orient(p1, p2, q2)
+    o3 = orient(q1, q2, p1)
+    o4 = orient(q1, q2, p2)
+
+    if (o1 * o2 < 0) and (o3 * o4 < 0):
+        return True
+    if o1 == 0 and on_segment(p1, p2, q1):
+        return True
+    if o2 == 0 and on_segment(p1, p2, q2):
+        return True
+    if o3 == 0 and on_segment(q1, q2, p1):
+        return True
+    if o4 == 0 and on_segment(q1, q2, p2):
+        return True
+    return False
+
+def has_self_intersection(poly: np.ndarray) -> bool:
+    n = poly.shape[0]
+    if n < 4:
+        return False
+    for i in range(n):
+        a1 = poly[i]
+        a2 = poly[(i + 1) % n]
+        for j in range(i + 1, n):
+            if abs(i - j) <= 1 or (i == 0 and j == n - 1):
+                continue
+            b1 = poly[j]
+            b2 = poly[(j + 1) % n]
+            if _segments_intersect(a1, a2, b1, b2):
+                return True
+    return False
+
+def repair_polygon_self_intersection(poly: np.ndarray) -> np.ndarray:
+    if poly.shape[0] < 4:
+        return poly
+    if not has_self_intersection(poly):
+        return poly
+    center = np.mean(poly, axis=0, keepdims=True)
+    vec = poly - center
+    ang = np.arctan2(vec[:, 1], vec[:, 0])
+    order = np.argsort(ang)
+    repaired = poly[order]
+    return repaired
+
+def polygon_iou_raster(poly_a: np.ndarray, poly_b: np.ndarray, img_h: int, img_w: int, downsample: int = 4) -> float:
+    if img_h <= 0 or img_w <= 0:
+        return 0.0
+    ds = max(1, int(downsample))
+    h = max(8, img_h // ds)
+    w = max(8, img_w // ds)
+    scale_x = w / max(1.0, float(img_w))
+    scale_y = h / max(1.0, float(img_h))
+
+    pa = poly_a.copy()
+    pb = poly_b.copy()
+    pa[:, 0] *= scale_x
+    pa[:, 1] *= scale_y
+    pb[:, 0] *= scale_x
+    pb[:, 1] *= scale_y
+
+    ma = np.zeros((h, w), dtype=np.uint8)
+    mb = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(ma, [pa.astype(np.int32)], 1)
+    cv2.fillPoly(mb, [pb.astype(np.int32)], 1)
+    inter = np.logical_and(ma, mb).sum()
+    union = np.logical_or(ma, mb).sum()
+    if union == 0:
+        return 0.0
+    return float(inter / union)
+
+def polygon_nms_indices(polys: list, scores: list, img_h: int, img_w: int, iou_thresh: float = 0.3, downsample: int = 4):
+    if len(polys) == 0:
+        return []
+    order = np.argsort(np.asarray(scores))[::-1]
+    keep = []
+    for idx in order:
+        keep_flag = True
+        for kept_idx in keep:
+            iou = polygon_iou_raster(polys[idx], polys[kept_idx], img_h, img_w, downsample=downsample)
+            if iou >= iou_thresh:
+                keep_flag = False
+                break
+        if keep_flag:
+            keep.append(int(idx))
+    return keep
+
 def _get_valid_hw_from_mask(mask: torch.Tensor):
     valid_rows = (~mask).any(dim=1)
     valid_cols = (~mask).any(dim=0)
@@ -181,7 +276,8 @@ def _get_valid_hw_from_mask(mask: torch.Tensor):
     return h, w
 
 def process_polygon_with_corners(poly_norm: torch.Tensor, corner_scores: torch.Tensor, img_h: int, img_w: int,
-                                 corner_thresh: float, nms_thresh: float, enable_nms: bool, num_corners: int = 64):
+                                 corner_thresh: float, nms_thresh: float, enable_nms: bool,
+                                 repair_self_intersection: bool = True, num_corners: int = 64):
     if img_h <= 0 or img_w <= 0: return None, None
     poly_np = poly_norm.detach().cpu().numpy().copy()
     poly_np[:, 0] *= img_w
@@ -202,6 +298,8 @@ def process_polygon_with_corners(poly_norm: torch.Tensor, corner_scores: torch.T
         corner_mask = np.ones(poly_np.shape[0], dtype=bool)
 
     poly_for_sampling = poly_np[corner_mask]
+    if repair_self_intersection:
+        poly_for_sampling = repair_polygon_self_intersection(poly_for_sampling)
     sampled_flat, corner_label = uniform_sampling_vectorized(poly_for_sampling.flatten(), num_corners)
     if sampled_flat is None: return None, None
 
@@ -215,10 +313,10 @@ def process_polygon_with_corners(poly_norm: torch.Tensor, corner_scores: torch.T
 # Helper Function 3: EMA Update
 # =============================================================================
 @torch.no_grad()
-def update_teacher(student_model, teacher_model, alpha=0.998):
+def update_teacher(student_model, teacher_model, alpha=0.9996):
     """
     Teacher = alpha * Teacher + (1-alpha) * Student
-    调低 alpha 让 Teacher 更快跟随，早期目标域更易出框
+    调高 alpha 到 0.9996 让 Teacher 更新更平滑，防止在长期训练中被 Student 的噪声带崩（温水煮青蛙）
     """
     for student_param, teacher_param in zip(student_model.parameters(), teacher_model.parameters()):
         teacher_param.data.mul_(alpha).add_(student_param.data, alpha=1 - alpha)
@@ -327,6 +425,10 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
             enable_corner_nms = not getattr(args, 'disable_pseudo_corner_nms', False)
             pseudo_min_box_area = getattr(args, 'pseudo_min_box_area', 0.004)
             pseudo_topk = getattr(args, 'pseudo_topk', 25)
+            enable_polygon_nms = not getattr(args, 'disable_pseudo_polygon_nms', False)
+            pseudo_polygon_nms_iou = float(getattr(args, 'pseudo_polygon_nms_iou', 0.3))
+            pseudo_polygon_nms_downsample = int(getattr(args, 'pseudo_polygon_nms_downsample', 4))
+            repair_pseudo_self_intersection = not getattr(args, 'disable_pseudo_self_intersection_repair', False)
             
             with torch.no_grad():
                 teacher_output = teacher(tgt_samples)
@@ -446,13 +548,15 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
                     processed_corner_labels = []
                     processed_boxes = []
                     processed_labels = []
+                    processed_scores = []
                     
                     for k_idx in range(sel_polys.shape[0]):
                         c_scores = None if sel_vtx is None else sel_vtx[k_idx].sigmoid()
                         
                         sampled_poly, sampled_corner = process_polygon_with_corners(
                             sel_polys[k_idx], c_scores, img_h, img_w,
-                            corner_thresh, corner_nms_thresh, enable_corner_nms, num_corners=64
+                            corner_thresh, corner_nms_thresh, enable_corner_nms,
+                            repair_self_intersection=repair_pseudo_self_intersection, num_corners=64
                         )
                         
                         if sampled_poly is not None:
@@ -460,6 +564,7 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
                             processed_corner_labels.append(sampled_corner)
                             processed_boxes.append(sel_boxes[k_idx])
                             processed_labels.append(sel_labels[k_idx])
+                            processed_scores.append(sel_scores[k_idx])
                     
                     if len(processed_polys) == 0:
                         pseudo_targets.append({
@@ -469,6 +574,27 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
                             'corner_labels': torch.empty((0, 64), device=device)
                         })
                         continue
+
+                    if enable_polygon_nms and len(processed_polys) > 1:
+                        polys_np_abs = []
+                        for p in processed_polys:
+                            p_abs = p.detach().cpu().numpy().copy()
+                            p_abs[:, 0] *= img_w
+                            p_abs[:, 1] *= img_h
+                            polys_np_abs.append(p_abs)
+                        score_vals = [float(s.detach().item()) for s in processed_scores]
+                        keep_poly_idx = polygon_nms_indices(
+                            polys_np_abs,
+                            score_vals,
+                            img_h,
+                            img_w,
+                            iou_thresh=pseudo_polygon_nms_iou,
+                            downsample=pseudo_polygon_nms_downsample,
+                        )
+                        processed_polys = [processed_polys[m] for m in keep_poly_idx]
+                        processed_corner_labels = [processed_corner_labels[m] for m in keep_poly_idx]
+                        processed_boxes = [processed_boxes[m] for m in keep_poly_idx]
+                        processed_labels = [processed_labels[m] for m in keep_poly_idx]
 
                     pseudo_targets.append({
                         'labels': torch.stack(processed_labels),
