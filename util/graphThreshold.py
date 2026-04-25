@@ -236,7 +236,7 @@ if __name__ == "__main__":
     main()
     '''
     python util/graphThreshold.py \
-        --log_path /data/zfx/myuda/uda_loveDA_run_v19/pseudo_threshold_log.txt \
-        --out_path /data/zfx/myuda/uda_loveDA_run_v19/threshold_dashboard.png \
+        --log_path /home/zfx/myuda/uda_shanghai_run_v1/pseudo_threshold_log.txt \
+        --out_path /home/zfx/myuda/uda_shanghai_run_v1/threshold_dashboard.png \
         --dpi 300
     '''

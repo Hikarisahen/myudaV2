@@ -59,11 +59,21 @@ CUSTOM_VIS_IMAGE_PATHS = [
     # "/data/zfx/datasets/GoogleMap/train/images/target_domain_000121.jpg",  # 建筑物
     # "/data/zfx/datasets/GoogleMap/train/images/target_domain_000152.jpg",  
     # "/data/zfx/datasets/GoogleMap/train/images/target_domain_000237.jpg",  
-    # GoogleMap
-    "/data/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
-    "/data/zfx/datasets/LoveDA/Train/Urban/images_png/2147.png",  # 简单大型建筑物
-    "/data/zfx/datasets/LoveDA/Train/Urban/images_png/1474.png",  # 稍复杂小建筑物
-    "/data/zfx/datasets/LoveDA/Train/Urban/images_png/1630.png",  # 复杂立体建筑物
+    # loveda
+    "/home/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
+    "/home/zfx/datasets/LoveDA/Train/Urban/images_png/2147.png",  # 简单大型建筑物
+    "/home/zfx/datasets/LoveDA/Train/Urban/images_png/1474.png",  # 稍复杂小建筑物
+    "/home/zfx/datasets/LoveDA/Train/Urban/images_png/1630.png",  # 复杂立体建筑物
+    # # wuhan
+    # "/home/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
+    # "/home/zfx/datasets/wuhan/train/images/tile_r0001_c0030.png",  # 
+    # "/home/zfx/datasets/wuhan/train/images/tile_r0024_c0029.png",  # 
+    # "/home/zfx/datasets/wuhan/train/images/tile_r0043_c0011.png",  # 
+    # # shanghai
+    # "/home/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
+    # "/home/zfx/datasets/shanghai/train/images/tile_r0000_c0041.png",  # 
+    # "/home/zfx/datasets/shanghai/train/images/tile_r0021_c0013.png",  # 
+    # "/home/zfx/datasets/shanghai/train/images/tile_r0035_c0001.png",  # 
 ]
 
 def get_args_parser():

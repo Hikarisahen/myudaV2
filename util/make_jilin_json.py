@@ -6,8 +6,8 @@ from tqdm import tqdm
 
 # ================= 配置区域 =================
 # 必须与你报错信息中的路径完全一致
-IMAGE_DIR = "/data/zfx/datasets/GoogleMap/train"
-JSON_OUTPUT_PATH = "/data/zfx/datasets/GoogleMap/train/annotation_detr.json"
+IMAGE_DIR = "/home/zfx/datasets/shanghai/train"
+JSON_OUTPUT_PATH = "/home/zfx/datasets/shanghai/annotation_detr.json"
 # ===========================================
 
 

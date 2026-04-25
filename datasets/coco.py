@@ -242,6 +242,10 @@ def build(image_set, args):
         "train": (root / "train" / "images", root / "train" / "annotation_detr.json"),
         "val": (root / "val" / "images", root / "val" / "annotation_detr.json"),
     } # CrowdAI 数据集文件结构
+    # PATHS = {
+    #     "train": (root / "tiles", root / "annotation_detr.json"),
+    #     "val": (root / "tiles", root /"annotation_detr.json"),
+    # } # Wuhan 数据集文件结构
 
     img_folder, ann_file = PATHS[image_set]
 
