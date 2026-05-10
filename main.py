@@ -23,8 +23,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from PIL import Image
+from util.box_ops import box_cxcywh_to_xyxy
 
 import torch.multiprocessing
 # === [新增] 强制使用文件系统策略，解决 Bad file descriptor/Resize 错误 ===
@@ -59,16 +60,16 @@ CUSTOM_VIS_IMAGE_PATHS = [
     # "/data/zfx/datasets/GoogleMap/train/images/target_domain_000121.jpg",  # 建筑物
     # "/data/zfx/datasets/GoogleMap/train/images/target_domain_000152.jpg",  
     # "/data/zfx/datasets/GoogleMap/train/images/target_domain_000237.jpg",  
-    # loveda
-    "/home/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
-    "/home/zfx/datasets/LoveDA/Train/Urban/images_png/2147.png",  # 简单大型建筑物
-    "/home/zfx/datasets/LoveDA/Train/Urban/images_png/1474.png",  # 稍复杂小建筑物
-    "/home/zfx/datasets/LoveDA/Train/Urban/images_png/1630.png",  # 复杂立体建筑物
-    # # wuhan
+    # # loveda
     # "/home/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
-    # "/home/zfx/datasets/wuhan/train/images/tile_r0001_c0030.png",  # 
-    # "/home/zfx/datasets/wuhan/train/images/tile_r0024_c0029.png",  # 
-    # "/home/zfx/datasets/wuhan/train/images/tile_r0043_c0011.png",  # 
+    # "/home/zfx/datasets/LoveDA/Train/Urban/images_png/2147.png",  # 简单大型建筑物
+    # "/home/zfx/datasets/LoveDA/Train/Urban/images_png/1474.png",  # 稍复杂小建筑物
+    # "/home/zfx/datasets/LoveDA/Train/Urban/images_png/1630.png",  # 复杂立体建筑物
+    # wuhan
+    "/home/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
+    "/home/zfx/datasets/wuhan/train/images/tile_r0001_c0030.png",  # 
+    "/home/zfx/datasets/wuhan/train/images/tile_r0024_c0029.png",  # 
+    "/home/zfx/datasets/wuhan/train/images/tile_r0043_c0011.png",  # 
     # # shanghai
     # "/home/zfx/datasets/CrowdAI/test_images/000000000041.jpg",
     # "/home/zfx/datasets/shanghai/train/images/tile_r0000_c0041.png",  # 
@@ -234,58 +235,70 @@ def get_args_parser():
 
     return parser
 
-def visualize_training_progress(model, samples, output_dir, epoch, device, pseudo_thr=0.5):
+def compute_teacher_vis_predictions(model, samples, device, pseudo_thr):
     """
-    在训练过程中可视化固定的样本 (Teacher 模型效果)
+    [拆分自 visualize_training_progress] 在固定可视化样本上跑 teacher 推理。
+    返回 (per_img_preds, inputs_cpu)，per_img_preds 是 list，每张图含：
+        - boxes:  Tensor[N, 4]  cxcywh 归一化
+        - polys:  Tensor[N, 64, 2]  xy 归一化
+        - corners: Tensor[N, 64] 已 sigmoid（None 表示无）
+        - scores: Tensor[N]
     """
     model.eval()
     inputs = samples.tensors.to(device)
     with torch.no_grad():
         outputs = model(inputs)
-    
+
     pred_logits = outputs['pred_logits']
-    # 优先使用演化后的结果
     pred_polys = outputs.get('pred_polys_evolve_1', outputs['pred_polys_init'])
     pred_corners = outputs.get('pred_vtx_logits_evolve_1', outputs.get('pred_corners_init', None))
-    
-    pixel_mean = torch.tensor([0.485, 0.456, 0.406]).to(device).view(3, 1, 1)
-    pixel_std = torch.tensor([0.229, 0.224, 0.225]).to(device).view(3, 1, 1)
-    
+    pred_boxes = outputs.get('pred_boxes', None)
+
     batch_size = inputs.shape[0]
+    per_img = []
+    for i in range(batch_size):
+        scores = pred_logits[i].sigmoid().squeeze(-1)
+        keep = scores > pseudo_thr
+        item = {
+            'boxes': pred_boxes[i][keep].detach().cpu() if pred_boxes is not None else torch.empty(0, 4),
+            'polys': pred_polys[i][keep].detach().cpu(),
+            'corners': pred_corners[i][keep].sigmoid().detach().cpu() if pred_corners is not None else None,
+            'scores': scores[keep].detach().cpu(),
+        }
+        per_img.append(item)
+    return per_img, inputs.detach().cpu()
+
+
+def draw_vis_figure(per_img_preds, inputs_cpu, output_dir, epoch, pseudo_thr):
+    """[拆分自 visualize_training_progress] 仅负责绘图。"""
+    pixel_mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    pixel_std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    batch_size = inputs_cpu.shape[0]
     fig, axs = plt.subplots(1, batch_size, figsize=(batch_size * 6, 6))
-    if batch_size == 1: axs = [axs]
-    
+    if batch_size == 1:
+        axs = [axs]
+
     for idx in range(batch_size):
         ax = axs[idx]
-        img = inputs[idx] * pixel_std + pixel_mean
-        img = img.clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+        img = inputs_cpu[idx] * pixel_std + pixel_mean
+        img = img.clamp(0, 1).permute(1, 2, 0).numpy()
         h, w = img.shape[:2]
-        
         ax.imshow(img)
-        
-        probs = pred_logits[idx].sigmoid()
-        scores = probs.squeeze(-1)
-        
-        # 使用当前可视化阈值进行筛选
-        keep = scores > pseudo_thr
-        
-        valid_polys = pred_polys[idx][keep]
-        valid_corners = pred_corners[idx][keep].sigmoid()
-        
+
+        item = per_img_preds[idx]
+        valid_polys = item['polys']
+        valid_corners = item['corners']
         for i in range(len(valid_polys)):
-            poly = valid_polys[i].cpu().numpy()
-            corner = valid_corners[i].cpu().numpy()
-            
+            poly = valid_polys[i].numpy().copy()
             poly[:, 0] *= w
             poly[:, 1] *= h
-            
             poly_closed = np.concatenate([poly, poly[0:1]], axis=0)
             ax.plot(poly_closed[:, 0], poly_closed[:, 1], c='cyan', linewidth=1.5)
-            
-            is_corner = corner > 0.5
-            if is_corner.any():
-                ax.scatter(poly[is_corner, 0], poly[is_corner, 1], c='red', s=4, zorder=10)
-
+            if valid_corners is not None:
+                corner = valid_corners[i].numpy()
+                is_corner = corner > 0.5
+                if is_corner.any():
+                    ax.scatter(poly[is_corner, 0], poly[is_corner, 1], c='red', s=4, zorder=10)
         ax.axis('off')
         ax.set_title(f"Epoch {epoch} - Teacher Pred (thr={pseudo_thr:.3f})")
 
@@ -294,6 +307,102 @@ def visualize_training_progress(model, samples, output_dir, epoch, device, pseud
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
+
+
+def _box_iou_cxcywh(box_a, box_b):
+    """box_a:[N,4], box_b:[M,4] cxcywh-normalized → IoU[N,M]"""
+    if box_a.numel() == 0 or box_b.numel() == 0:
+        return torch.zeros(box_a.shape[0], box_b.shape[0])
+    a = box_cxcywh_to_xyxy(box_a)
+    b = box_cxcywh_to_xyxy(box_b)
+    area_a = (a[:, 2] - a[:, 0]).clamp(min=0) * (a[:, 3] - a[:, 1]).clamp(min=0)
+    area_b = (b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0)
+    lt = torch.max(a[:, None, :2], b[None, :, :2])
+    rb = torch.min(a[:, None, 2:], b[None, :, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    union = area_a[:, None] + area_b[None, :] - inter
+    return inter / union.clamp(min=1e-6)
+
+
+def compute_vis_stability(curr_preds, prev_preds):
+    """
+    每张图：双向最大 IoU 平均
+        stab_i = (mean_{c}max_{p} IoU(c,p) + mean_{p}max_{c} IoU(c,p)) / 2
+    无 prev 返回 NaN；某图两边都为空记为 1.0；只有一边为空记为 0.0。
+    """
+    if prev_preds is None or len(curr_preds) != len(prev_preds):
+        return float('nan')
+    per_img = []
+    for ci, pi in zip(curr_preds, prev_preds):
+        c_boxes = ci.get('boxes')
+        p_boxes = pi.get('boxes')
+        if c_boxes is None or p_boxes is None:
+            continue
+        if c_boxes.numel() == 0 and p_boxes.numel() == 0:
+            per_img.append(1.0)
+            continue
+        if c_boxes.numel() == 0 or p_boxes.numel() == 0:
+            per_img.append(0.0)
+            continue
+        iou_mat = _box_iou_cxcywh(c_boxes, p_boxes)
+        best_curr = iou_mat.max(dim=1).values
+        best_prev = iou_mat.max(dim=0).values
+        per_img.append((best_curr.mean().item() + best_prev.mean().item()) / 2.0)
+    if not per_img:
+        return float('nan')
+    return sum(per_img) / len(per_img)
+
+
+def compute_source_baseline_count(dataset):
+    """从 source train COCO API 直接统计每图平均 GT 框数（毫秒级，无 inference）。"""
+    coco = getattr(dataset, 'coco', None)
+    if coco is None or not coco.imgs:
+        return 0.0
+    counts = []
+    for img_id in coco.imgs:
+        counts.append(len(coco.imgToAnns.get(img_id, [])))
+    return sum(counts) / max(1, len(counts))
+
+
+def load_or_create_val_subset(source_path, dataset_val, n_subset=500, seed=42):
+    """
+    跨实验共享的固定 val 子集 indices。
+    存放位置：<source_path>/source_eval_subset_<n>.json
+    存在则读，不存在则用固定 seed 抽样并写入。
+    """
+    subset_path = Path(source_path) / f"source_eval_subset_{n_subset}.json"
+    if subset_path.exists():
+        try:
+            with subset_path.open('r') as f:
+                payload = json.load(f)
+            indices = payload['indices']
+            print(f"[ValSubset] Loaded {len(indices)} indices from {subset_path}")
+            return indices
+        except Exception as e:
+            print(f"[ValSubset] Failed to load {subset_path}: {e}; recreating.")
+    n_total = len(dataset_val)
+    n_pick = min(n_subset, n_total)
+    rng = random.Random(seed)
+    indices = sorted(rng.sample(range(n_total), n_pick))
+    try:
+        subset_path.parent.mkdir(parents=True, exist_ok=True)
+        with subset_path.open('w') as f:
+            json.dump({'indices': indices, 'seed': seed, 'n_total': n_total}, f)
+        print(f"[ValSubset] Created new subset at {subset_path} ({n_pick} of {n_total})")
+    except Exception as e:
+        print(f"[ValSubset] Could not write {subset_path}: {e}; using in-memory only.")
+    return indices
+
+
+def build_val_subset_coco(dataset_val, val_subset_indices):
+    """构造过滤后的 COCO API（仅子集 image_id 内的 images/annotations）。"""
+    keep_ids = set(dataset_val.ids[i] for i in val_subset_indices)
+    sub = copy.deepcopy(dataset_val.coco)
+    sub.dataset['images'] = [img for img in sub.dataset['images'] if img['id'] in keep_ids]
+    sub.dataset['annotations'] = [ann for ann in sub.dataset['annotations'] if ann['image_id'] in keep_ids]
+    sub.createIndex()
+    return sub
 
 def load_custom_vis_samples(image_paths, dataset):
     if not image_paths:
@@ -453,6 +562,23 @@ def main(args):
     data_loader_target_eval = DataLoader(dataset_target_eval, args.batch_size, sampler=sampler_target_eval,
                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers,
                                  pin_memory=False)
+
+    # === [新增] 源域 baseline 统计 + 固定 val 子集（500 张）===
+    source_avg_buildings_per_image = compute_source_baseline_count(dataset_source_train)
+    print(f"[SourceBaseline] avg buildings per image: {source_avg_buildings_per_image:.3f}")
+
+    val_subset_indices = load_or_create_val_subset(args.source_path, dataset_val, n_subset=500, seed=42)
+    dataset_val_subset = Subset(dataset_val, val_subset_indices)
+    sampler_val_subset = torch.utils.data.SequentialSampler(dataset_val_subset)
+    data_loader_val_subset = DataLoader(
+        dataset_val_subset, args.batch_size, sampler=sampler_val_subset,
+        drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers,
+        pin_memory=False,
+    )
+    base_ds_val_subset = build_val_subset_coco(dataset_val, val_subset_indices)
+    print(f"[ValSubset] DataLoader ready: {len(dataset_val_subset)} images, "
+          f"{len(base_ds_val_subset.dataset['annotations'])} annotations")
+    # =======================================================
 
     # 可视化样本准备
     vis_samples = None
@@ -614,6 +740,12 @@ def main(args):
     prev_prev_train_stats = None
     last_retrain_epoch = -10**9
     max_avg_confidence_kept = 0.0
+    # === [新增] best 选择新逻辑所需状态 ===
+    source_baseline_ap = None       # burn-in 末记录的源域 AP，作为 G1 锚点
+    last_source_ap = None           # 上一次评估的源域 AP（每 10 epoch 更新）
+    prev_vis_predictions = None     # 上一 epoch 在 vis_samples 上的 teacher 预测（算 vis_stability）
+    best_score = -float('inf')      # 复合分历史最高
+    # =====================================
 
     def get_retrain_interval(stage2_epoch):
         if stage2_epoch <= 0:
@@ -773,20 +905,13 @@ def main(args):
         quantile_pseudo_thr = float(train_stats.get('pseudo_thr_quantile_mean', float('nan')))
 
         # =====================================================================
-        # [新增] 动态保存 Target 域历史最佳权重 (依据 pseudo_conf_kept_mean)
+        # [保留] 仅维护 max_avg_confidence_kept，用于 retrain 事件触发逻辑
+        # （best 模型选择已迁移到下方"3 门控 + 复合分"逻辑）
         # =====================================================================
         if epoch_pseudo_conf_kept_mean and not np.isnan(epoch_pseudo_conf_kept_mean):
             if epoch_pseudo_conf_kept_mean > max_avg_confidence_kept:
                 max_avg_confidence_kept = epoch_pseudo_conf_kept_mean
-                if args.output_dir and utils.is_main_process() and best_ckpt_path is not None:
-                    print(f"🌟 [New Best Target Model] conf_kept reached {max_avg_confidence_kept:.6f}. Saving to {best_ckpt_path}")
-                    utils.save_on_master({
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'epoch': epoch,
-                        'args': args,
-                    }, best_ckpt_path)
+        epoch_n_pseudo = float(train_stats.get('pseudo_count_per_img', float('nan')))
 
         print(
             f"[PseudoThr][Epoch {epoch}] raw={raw_pseudo_thr:.6f}, "
@@ -809,20 +934,124 @@ def main(args):
         
         lr_scheduler.step()
 
-        # 可视化 (使用 Teacher 模型查看伪标签效果)
+        # =====================================================================
+        # [新增] 源域 eval：每 10 epoch + burn-in 末 + 最后一 epoch
+        # 使用 500 张固定子集 + 过滤后的 COCO API（跨实验可比）
+        # =====================================================================
+        test_stats = {}
+        test_bbox_ap = None
+        test_bbox_ap50 = None
+        test_bbox_ap75 = None
+        do_source_eval = (
+            ((epoch + 1) % 10 == 0)
+            or ((epoch + 1) == args.epochs)
+            or (epoch == (args.burn_in_epochs - 1))
+        )
+        if do_source_eval:
+            print(f"Evaluating Teacher on Source val subset at epoch {epoch}...")
+            test_stats, _ = evaluate(
+                teacher_model, criterion, postprocessors,
+                data_loader_val_subset, base_ds_val_subset, device, args.output_dir
+            )
+            if 'coco_eval_bbox' in test_stats:
+                test_bbox_ap = test_stats['coco_eval_bbox'][0]
+                if len(test_stats['coco_eval_bbox']) > 2:
+                    test_bbox_ap50 = test_stats['coco_eval_bbox'][1]
+                    test_bbox_ap75 = test_stats['coco_eval_bbox'][2]
+                last_source_ap = test_bbox_ap
+
+        # Burn-in 末记录 baseline AP（G1 锚点）
+        if epoch == (args.burn_in_epochs - 1) and test_bbox_ap is not None:
+            source_baseline_ap = test_bbox_ap
+            print(f"[SourceBaseline] AP at burn-in end (epoch {epoch}): {source_baseline_ap:.6f}")
+
+        # =====================================================================
+        # [新增] 在固定 vis_samples 上跑 teacher 预测，算 vis_stability
+        # =====================================================================
+        curr_vis_preds = None
+        vis_inputs_cpu = None
+        vis_stability = float('nan')
+        vis_pseudo_thr = effective_pseudo_thr if not np.isnan(effective_pseudo_thr) else 0.5
         if args.output_dir and vis_samples is not None and utils.is_main_process():
             try:
-                vis_pseudo_thr = effective_pseudo_thr if not np.isnan(effective_pseudo_thr) else 0.5
-                visualize_training_progress(
-                    teacher_model,
-                    vis_samples,
-                    args.output_dir,
-                    epoch,
-                    device,
-                    pseudo_thr=vis_pseudo_thr,
+                curr_vis_preds, vis_inputs_cpu = compute_teacher_vis_predictions(
+                    teacher_model, vis_samples, device, vis_pseudo_thr
                 )
+                vis_stability = compute_vis_stability(curr_vis_preds, prev_vis_predictions)
+                prev_vis_predictions = curr_vis_preds
             except Exception as e:
-                print(f"Vis failed: {e}")
+                print(f"[VisStability] failed: {e}")
+
+        # =====================================================================
+        # [新增] Best 选择：3 门控 + 复合分
+        # =====================================================================
+        gate_burn_in = epoch >= args.burn_in_epochs
+        # G1: 源域 AP 跌幅 ≤ 5%（无 baseline 或本次没评估则 pass）
+        if (source_baseline_ap is None) or (last_source_ap is None):
+            gate_g1 = True
+            gate_g1_reason = "no_baseline_or_no_eval"
+        else:
+            gate_g1 = last_source_ap >= source_baseline_ap * 0.95
+            gate_g1_reason = (
+                f"last_src_ap={last_source_ap:.4f}, baseline={source_baseline_ap:.4f}, "
+                f"min_required={source_baseline_ap * 0.95:.4f}"
+            )
+        # G2: n_pseudo_per_img ∈ [0.3 × source_avg, 2.0 × source_avg]
+        if np.isnan(epoch_n_pseudo) or source_avg_buildings_per_image <= 0:
+            gate_g2 = True
+            gate_g2_reason = "no_pseudo_count_or_no_baseline"
+        else:
+            g2_low = 0.3 * source_avg_buildings_per_image
+            g2_high = 2.0 * source_avg_buildings_per_image
+            gate_g2 = g2_low <= epoch_n_pseudo <= g2_high
+            gate_g2_reason = f"n_pseudo={epoch_n_pseudo:.3f}, range=[{g2_low:.3f}, {g2_high:.3f}]"
+        # 复合分
+        conf_kept_for_score = epoch_pseudo_conf_kept_mean if not np.isnan(epoch_pseudo_conf_kept_mean) else 0.0
+        if not np.isnan(vis_stability):
+            composite_score = 0.5 * conf_kept_for_score + 0.5 * vis_stability
+        else:
+            composite_score = conf_kept_for_score if not np.isnan(epoch_pseudo_conf_kept_mean) else float('nan')
+
+        is_best = False
+        if (gate_burn_in and gate_g1 and gate_g2
+                and (not np.isnan(composite_score))
+                and composite_score > best_score):
+            best_score = composite_score
+            is_best = True
+            if args.output_dir and utils.is_main_process() and best_ckpt_path is not None:
+                vs_str = f"{vis_stability:.4f}" if not np.isnan(vis_stability) else "nan"
+                print(
+                    f"🌟 [New Best Target Model] score={composite_score:.6f} "
+                    f"(conf_kept={conf_kept_for_score:.4f}, vis_stab={vs_str}). "
+                    f"Saving to {best_ckpt_path}"
+                )
+                utils.save_on_master({
+                    'model': model_without_ddp.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
+                    'epoch': epoch,
+                    'args': args,
+                    'best_score': best_score,
+                    'best_conf_kept': conf_kept_for_score,
+                    'best_vis_stability': vis_stability,
+                    'last_source_ap': last_source_ap,
+                    'source_baseline_ap': source_baseline_ap,
+                }, best_ckpt_path)
+        elif gate_burn_in and not (gate_g1 and gate_g2):
+            print(
+                f"[BestSelect] SKIP at epoch {epoch}: "
+                f"G1={int(gate_g1)} ({gate_g1_reason}); "
+                f"G2={int(gate_g2)} ({gate_g2_reason})"
+            )
+
+        # =====================================================================
+        # 可视化（复用上面 compute 出来的预测）
+        # =====================================================================
+        if args.output_dir and curr_vis_preds is not None and utils.is_main_process():
+            try:
+                draw_vis_figure(curr_vis_preds, vis_inputs_cpu, args.output_dir, epoch, vis_pseudo_thr)
+            except Exception as e:
+                print(f"Vis draw failed: {e}")
 
         # Checkpointing
         if args.output_dir:
@@ -837,23 +1066,6 @@ def main(args):
                     'epoch': epoch,
                     'args': args,
                 }, checkpoint_path)
-
-        # Eval (使用 Teacher 模型评估，通常 Teacher 泛化更好)
-        test_stats = {}
-        test_bbox_ap = None
-        test_bbox_ap50 = None
-        test_bbox_ap75 = None
-        # 评估周期 评估间隔周期
-        if (epoch + 1) % 120 == 0 or (epoch + 1) == args.epochs:
-            print(f"Evaluating Teacher Model at epoch {epoch}...")
-            test_stats, coco_evaluator = evaluate(
-                teacher_model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-            )
-            if 'coco_eval_bbox' in test_stats:
-                test_bbox_ap = test_stats['coco_eval_bbox'][0]
-                if len(test_stats['coco_eval_bbox']) > 2:
-                    test_bbox_ap50 = test_stats['coco_eval_bbox'][1]
-                    test_bbox_ap75 = test_stats['coco_eval_bbox'][2]
 
         # 每轮记录 Teacher 在目标域上的表现（使用 target_eval loader）
         target_test_stats = {}
@@ -905,6 +1117,19 @@ def main(args):
                      'pseudo_thr_target_ema': target_ema_pseudo_thr,
                      'pseudo_thr_quantile': quantile_pseudo_thr,
                      'pseudo_thr_effective': effective_pseudo_thr,
+                     # === [新增] best 选择相关字段 ===
+                     'n_pseudo_per_img': epoch_n_pseudo,
+                     'source_avg_buildings_per_image': source_avg_buildings_per_image,
+                     'source_baseline_ap': source_baseline_ap,
+                     'last_source_ap': last_source_ap,
+                     'vis_stability': vis_stability,
+                     'composite_score': composite_score,
+                     'gate_g1_pass': int(gate_g1),
+                     'gate_g2_pass': int(gate_g2),
+                     'gate_burn_in_pass': int(gate_burn_in),
+                     'is_best': int(is_best),
+                     'best_score': best_score if best_score != -float('inf') else None,
+                     # ===============================
                      'epoch': epoch,
                      'n_parameters': n_parameters}
 
@@ -923,7 +1148,12 @@ def main(args):
                         "\tretrain_triggered(是否实际重训)"
                         "\tretrain_stage2_epoch(第二阶段轮次)\tretrain_interval(当前阶段重训间隔)"
                         "\tretrain_gate_pass(门控是否通过)\tretrain_action(重训动作)"
-                        "\tretrain_gate_reason(门控原因)\n"
+                        "\tretrain_gate_reason(门控原因)"
+                        "\tn_pseudo_per_img(每图伪标签数)\tsource_avg(源域每图平均建筑数)"
+                        "\tsource_baseline_ap(burn-in末源域AP)\tlast_source_ap(最近一次源域AP)"
+                        "\tvis_stability(可视化稳定性)\tcomposite_score(复合分)"
+                        "\tgate_g1(源域AP门控)\tgate_g2(伪标签数门控)"
+                        "\tis_best(本轮是否更新best)\tbest_score(历史最高复合分)\n"
                     )
                 raw_str = f"{raw_pseudo_thr:.6f}"
                 tgt_ema_str = f"{target_ema_pseudo_thr:.6f}"
@@ -932,11 +1162,21 @@ def main(args):
                 conf_str = f"{epoch_pseudo_conf_mean:.6f}"
                 conf_kept_str = f"{epoch_pseudo_conf_kept_mean:.6f}"
                 gate_reason_sanitized = str(retrain_gate_reason).replace('\t', ' ').replace('\n', ' ')
+                n_pseudo_str = f"{epoch_n_pseudo:.6f}" if not np.isnan(epoch_n_pseudo) else "nan"
+                source_avg_str = f"{source_avg_buildings_per_image:.6f}"
+                src_baseline_str = f"{source_baseline_ap:.6f}" if source_baseline_ap is not None else "nan"
+                last_src_ap_str = f"{last_source_ap:.6f}" if last_source_ap is not None else "nan"
+                vis_stab_str = f"{vis_stability:.6f}" if not np.isnan(vis_stability) else "nan"
+                comp_score_str = f"{composite_score:.6f}" if not np.isnan(composite_score) else "nan"
+                best_score_str = f"{best_score:.6f}" if best_score != -float('inf') else "nan"
                 f.write(
                     f"{epoch}\t{raw_str}\t{tgt_ema_str}\t{q_str}\t{eff_str}\t{conf_str}\t{conf_kept_str}"
                     f"\t{int(retrain_due)}\t{int(retrain_schedule_due)}\t{int(retrain_event_due)}\t{int(retrain_cooldown_ok)}"
                     f"\t{int(retrain_triggered)}\t{stage2_epoch}\t{retrain_interval_curr}"
-                    f"\t{int(retrain_gate_pass)}\t{retrain_action}\t{gate_reason_sanitized}\n"
+                    f"\t{int(retrain_gate_pass)}\t{retrain_action}\t{gate_reason_sanitized}"
+                    f"\t{n_pseudo_str}\t{source_avg_str}\t{src_baseline_str}\t{last_src_ap_str}"
+                    f"\t{vis_stab_str}\t{comp_score_str}\t{int(gate_g1)}\t{int(gate_g2)}"
+                    f"\t{int(is_best)}\t{best_score_str}\n"
                 )
             
             if writer is not None:

@@ -364,6 +364,8 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
     pseudo_thr_target_ema_sum = 0.0
     pseudo_thr_quantile_sum = 0.0
     pseudo_thr_count = 0
+    pseudo_count_total = 0
+    pseudo_count_imgs = 0
 
     thr_quantile = float(getattr(args, 'pseudo_thr_quantile', 0.94))
     thr_quantile = min(0.99, max(0.5, thr_quantile))
@@ -602,7 +604,12 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
                         'poly_coords': torch.stack(processed_polys),
                         'corner_labels': torch.stack(processed_corner_labels)
                     })
-        
+
+            # [新增] 累计每图最终保留的伪标签数（仅在非 burn-in 且 lambda_unsup>0 时统计）
+            for _pt in pseudo_targets:
+                pseudo_count_imgs += 1
+                pseudo_count_total += int(_pt['labels'].numel())
+
         # 4. Student Forward & Loss Calculation
         import contextlib
         def get_no_sync_context(m):
@@ -694,6 +701,7 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
     stats['pseudo_thr_effective_mean'] = (pseudo_thr_effective_sum / pseudo_thr_count) if pseudo_thr_count > 0 else float('nan')
     stats['pseudo_thr_target_ema_mean'] = (pseudo_thr_target_ema_sum / pseudo_thr_count) if pseudo_thr_count > 0 else float('nan')
     stats['pseudo_thr_quantile_mean'] = (pseudo_thr_quantile_sum / pseudo_thr_count) if pseudo_thr_count > 0 else float('nan')
+    stats['pseudo_count_per_img'] = (pseudo_count_total / pseudo_count_imgs) if pseudo_count_imgs > 0 else float('nan')
     return stats
 
 @torch.no_grad()

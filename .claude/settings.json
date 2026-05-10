@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/22515/.claude/projects/c--Users-22515-Desktop-myproject-myudaV2/memory/**)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py', 'r', encoding='utf-8'\\).read\\(\\)\\); print\\('main.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('engine.py', 'r', encoding='utf-8'\\).read\\(\\)\\); print\\('engine.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/Users/22515/Desktop/myproject/myudaV2/main.py', 'r', encoding='utf-8'\\).read\\(\\)\\); print\\('main.py OK'\\)\")",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\(r'c:\\\\Users\\\\22515\\\\Desktop\\\\myproject\\\\myudaV2\\\\main.py','r',encoding='utf-8'\\).read\\(\\)\\); print\\('main.py OK'\\)\")",
+      "PowerShell(py -c \"import ast; ast.parse\\(open\\(r'c:\\\\Users\\\\22515\\\\Desktop\\\\myproject\\\\myudaV2\\\\main.py','r',encoding='utf-8'\\).read\\(\\)\\); print\\('main.py OK'\\)\")",
+      "PowerShell(Get-Command python)",
+      "PowerShell(python --version)"
+    ]
+  }
+}
