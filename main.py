@@ -638,45 +638,89 @@ def main(args):
     base_ds_target = get_coco_api_from_dataset(dataset_target_eval)
 
     # 6. 加载预训练权重 (Student & Teacher)
-    # 如果指定了 resume，则加载 checkpoint
+    # 自动判别：是"断点续训"还是"从外部预训练权重初始化"
+    #   - 续训判据：checkpoint 同时包含 'teacher_model' 或 'uda_run' 标记
+    #     （我方 UDA 训练保存的 checkpoint.pth/checkpoint_target_best.pth 都带这些字段）
+    #   - 否则按预训练初始化处理：丢弃 class_embed、不恢复 optimizer/epoch
+    args._resume_state = None
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-            
+
+        is_resume_mode = ('teacher_model' in checkpoint) or bool(checkpoint.get('uda_run', False))
         state_dict = checkpoint['model']
-        
-        # 过滤不匹配的键
-        keys_to_remove = [k for k in state_dict.keys() if k.startswith("class_embed")]
-        for k in keys_to_remove:
-            del state_dict[k]
-            
-        # 加载到 Student
-        missing_keys, unexpected_keys = model_without_ddp.load_state_dict(state_dict, strict=False)
-        print(f"Student Load - Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
-        
-        # 加载到 Teacher (保持一致)
-        teacher_model.load_state_dict(state_dict, strict=False)
-        
-        # -------------------------------------------------------------------------
-        # 修改部分：健壮的权重加载逻辑
-        # -------------------------------------------------------------------------
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            try:
-                # 尝试加载优化器
-                optimizer.load_state_dict(checkpoint['optimizer'])
-                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-                # 如果成功加载，说明是“断点续训”，恢复 Epoch
-                args.start_epoch = checkpoint['epoch'] + 1
-                print(f"✅ 成功恢复优化器状态，从 Epoch {args.start_epoch} 继续训练。")
-            except ValueError as e:
-                # 如果加载失败（通常是因为模型结构变了，比如加了 MAE），则忽略优化器状态
-                print(f"⚠️ 警告: 优化器加载失败 (参数不匹配)。")
-                print(f"   原因: {e}")
-                print(f"   处理: 忽略旧优化器状态，使用新初始化的优化器从 Epoch 0 开始 UDA 训练。")
-                # 保持 args.start_epoch = 0
-        # -------------------------------------------------------------------------
+
+        if is_resume_mode:
+            print(f"🔁 [Resume] 检测到 UDA checkpoint (epoch={checkpoint.get('epoch', '?')})，进入断点续训模式")
+            # 续训：保留 class_embed
+            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(state_dict, strict=False)
+            print(f"  Student Load - Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
+
+            if 'teacher_model' in checkpoint:
+                t_missing, t_unexpected = teacher_model.load_state_dict(checkpoint['teacher_model'], strict=False)
+                print(f"  Teacher Load - Missing: {len(t_missing)}, Unexpected: {len(t_unexpected)}")
+            else:
+                teacher_model.load_state_dict(state_dict, strict=False)
+                print(f"  ⚠️ checkpoint 中无 teacher_model 字段，Teacher 退化为 Student 副本（兼容旧 ckpt）")
+
+            if not args.eval and all(k in checkpoint for k in ('optimizer', 'lr_scheduler', 'epoch')):
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                    lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+                    args.start_epoch = checkpoint['epoch'] + 1
+                    print(f"✅ 成功恢复优化器/调度器，从 Epoch {args.start_epoch} 继续训练")
+                except (ValueError, KeyError) as e:
+                    # 续训语义不允许悄悄从 0 开始，直接抛错让用户感知
+                    raise RuntimeError(
+                        f"续训 checkpoint 的 optimizer/scheduler 与当前模型不匹配，无法恢复: {e}\n"
+                        f"如确实要从该权重重新开始训练，请改用一份不含 'teacher_model' 字段的纯权重文件。"
+                    )
+
+            # 伪标签阈值 EMA（保存在 criterion 属性上）
+            thr_ema = checkpoint.get('pseudo_target_thr_ema', None)
+            if thr_ema is not None:
+                criterion.pseudo_target_thr_ema = float(thr_ema)
+                print(f"  Restored pseudo_target_thr_ema = {criterion.pseudo_target_thr_ema:.6f}")
+
+            # 跨 epoch 状态：缓存到 args，稍后在循环初始化处覆盖默认值
+            args._resume_state = {
+                'best_score': checkpoint.get('best_score', None),
+                'source_baseline_ap': checkpoint.get('source_baseline_ap', None),
+                'last_source_ap': checkpoint.get('last_source_ap', None),
+                'max_avg_confidence_kept': checkpoint.get('max_avg_confidence_kept', None),
+            }
+
+            # RNG state
+            rng = checkpoint.get('rng_state', None)
+            if rng is not None:
+                try:
+                    if rng.get('torch') is not None:
+                        t = rng['torch']
+                        torch.set_rng_state(t.cpu() if torch.is_tensor(t) else t)
+                    if rng.get('cuda') is not None and torch.cuda.is_available():
+                        cuda_states = rng['cuda']
+                        cuda_states = [s.cpu() if torch.is_tensor(s) else s for s in cuda_states]
+                        torch.cuda.set_rng_state_all(cuda_states)
+                    if rng.get('numpy') is not None:
+                        np.random.set_state(rng['numpy'])
+                    if rng.get('python') is not None:
+                        random.setstate(rng['python'])
+                    print("  Restored RNG state.")
+                except Exception as e:
+                    print(f"  ⚠️ RNG 恢复失败（忽略）: {e}")
+        else:
+            print(f"🆕 [Pretrain Init] 外部预训练权重（无 teacher_model 字段），按从头训练加载，start_epoch=0")
+            # 丢弃可能不匹配的分类头
+            keys_to_remove = [k for k in state_dict.keys() if k.startswith("class_embed")]
+            for k in keys_to_remove:
+                del state_dict[k]
+            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(state_dict, strict=False)
+            print(f"  Student Load - Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
+            # Teacher 与 Student 对齐
+            teacher_model.load_state_dict(model_without_ddp.state_dict(), strict=False)
+            args.start_epoch = 0
 
     output_dir = Path(args.output_dir)
     writer = None
@@ -745,6 +789,21 @@ def main(args):
     last_source_ap = None           # 上一次评估的源域 AP（每 10 epoch 更新）
     prev_vis_predictions = None     # 上一 epoch 在 vis_samples 上的 teacher 预测（算 vis_stability）
     best_score = -float('inf')      # 复合分历史最高
+    # === [续训] 用 checkpoint 中保存的跨 epoch 状态覆盖默认值 ===
+    _resume_state = getattr(args, '_resume_state', None)
+    if _resume_state is not None:
+        if _resume_state.get('best_score') is not None:
+            best_score = float(_resume_state['best_score'])
+        if _resume_state.get('source_baseline_ap') is not None:
+            source_baseline_ap = float(_resume_state['source_baseline_ap'])
+        if _resume_state.get('last_source_ap') is not None:
+            last_source_ap = float(_resume_state['last_source_ap'])
+        if _resume_state.get('max_avg_confidence_kept') is not None:
+            max_avg_confidence_kept = float(_resume_state['max_avg_confidence_kept'])
+        print(
+            f"[Resume] best_score={best_score}, source_baseline_ap={source_baseline_ap}, "
+            f"last_source_ap={last_source_ap}, max_avg_conf_kept={max_avg_confidence_kept}"
+        )
     # =====================================
 
     def get_retrain_interval(stage2_epoch):
@@ -1026,16 +1085,20 @@ def main(args):
                     f"Saving to {best_ckpt_path}"
                 )
                 utils.save_on_master({
+                    'uda_run': True,
                     'model': model_without_ddp.state_dict(),
+                    'teacher_model': teacher_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
                     'args': args,
+                    'pseudo_target_thr_ema': float(getattr(criterion, 'pseudo_target_thr_ema', float('nan'))),
                     'best_score': best_score,
                     'best_conf_kept': conf_kept_for_score,
                     'best_vis_stability': vis_stability,
                     'last_source_ap': last_source_ap,
                     'source_baseline_ap': source_baseline_ap,
+                    'max_avg_confidence_kept': max_avg_confidence_kept,
                 }, best_ckpt_path)
         elif gate_burn_in and not (gate_g1 and gate_g2):
             print(
@@ -1058,13 +1121,30 @@ def main(args):
             checkpoint_paths = [output_dir / 'checkpoint.pth']
             if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 5 == 0:
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
+            try:
+                rng_state = {
+                    'torch': torch.get_rng_state(),
+                    'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                    'numpy': np.random.get_state(),
+                    'python': random.getstate(),
+                }
+            except Exception:
+                rng_state = None
             for checkpoint_path in checkpoint_paths:
                 utils.save_on_master({
+                    'uda_run': True,
                     'model': model_without_ddp.state_dict(),
+                    'teacher_model': teacher_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
                     'args': args,
+                    'pseudo_target_thr_ema': float(getattr(criterion, 'pseudo_target_thr_ema', float('nan'))),
+                    'best_score': best_score if best_score != -float('inf') else None,
+                    'source_baseline_ap': source_baseline_ap,
+                    'last_source_ap': last_source_ap,
+                    'max_avg_confidence_kept': max_avg_confidence_kept,
+                    'rng_state': rng_state,
                 }, checkpoint_path)
 
         # 每轮记录 Teacher 在目标域上的表现（使用 target_eval loader）

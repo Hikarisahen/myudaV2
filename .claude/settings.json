@@ -8,7 +8,11 @@
       "PowerShell(python -c \"import ast; ast.parse\\(open\\(r'c:\\\\Users\\\\22515\\\\Desktop\\\\myproject\\\\myudaV2\\\\main.py','r',encoding='utf-8'\\).read\\(\\)\\); print\\('main.py OK'\\)\")",
       "PowerShell(py -c \"import ast; ast.parse\\(open\\(r'c:\\\\Users\\\\22515\\\\Desktop\\\\myproject\\\\myudaV2\\\\main.py','r',encoding='utf-8'\\).read\\(\\)\\); print\\('main.py OK'\\)\")",
       "PowerShell(Get-Command python)",
-      "PowerShell(python --version)"
+      "PowerShell(python --version)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\" 2>&1)",
+      "PowerShell(py -c \"import ast; ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
     ]
   }
 }
