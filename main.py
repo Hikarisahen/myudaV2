@@ -37,7 +37,7 @@ import util.misc as utils
 from util.misc import nested_tensor_from_tensor_list
 import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
-from engine import evaluate, train_one_epoch  # 这里调用的是修改后的支持 UDA 的 train_one_epoch
+from engine import evaluate, train_one_epoch, DynamicThreshold  # 这里调用的是修改后的支持 UDA 的 train_one_epoch
 from models import build_model
 import matplotlib
 matplotlib.use("Agg")
@@ -684,6 +684,14 @@ def main(args):
                 criterion.pseudo_target_thr_ema = float(thr_ema)
                 print(f"  Restored pseudo_target_thr_ema = {criterion.pseudo_target_thr_ema:.6f}")
 
+            # 源域引导的动态阈值（per-class）
+            dyn_thr = checkpoint.get('dynamic_threshold_thresholds', None)
+            if dyn_thr is not None:
+                criterion.dynamic_threshold = DynamicThreshold(criterion.num_classes)
+                dyn_thr_tensor = dyn_thr if torch.is_tensor(dyn_thr) else torch.tensor(dyn_thr)
+                criterion.dynamic_threshold.thresholds = dyn_thr_tensor.to(criterion.dynamic_threshold.thresholds.device)
+                print(f"  Restored dynamic_threshold.thresholds = {criterion.dynamic_threshold.thresholds.detach().cpu().tolist()}")
+
             # 跨 epoch 状态：缓存到 args，稍后在循环初始化处覆盖默认值
             args._resume_state = {
                 'best_score': checkpoint.get('best_score', None),
@@ -868,7 +876,7 @@ def main(args):
             gate_reason = "no previous stats"
             if prev_train_stats is not None:
                 prev_conf_mean = float(prev_train_stats.get('pseudo_conf_mean', float('nan')))
-                prev_conf_kept = float(prev_train_stats.get('pseudo_conf_kept', float('nan')))
+                prev_conf_kept = float(prev_train_stats.get('pseudo_conf_kept_mean', float('nan')))
                 low_conf = (not np.isnan(prev_conf_mean)) and (prev_conf_mean <= args.retrain_gate_conf_mean_max)
                 low_kept = (not np.isnan(prev_conf_kept)) and (prev_conf_kept <= args.retrain_gate_conf_kept_max)
                 gate_pass = low_conf or low_kept
@@ -1093,6 +1101,10 @@ def main(args):
                     'epoch': epoch,
                     'args': args,
                     'pseudo_target_thr_ema': float(getattr(criterion, 'pseudo_target_thr_ema', float('nan'))),
+                    'dynamic_threshold_thresholds': (
+                        criterion.dynamic_threshold.thresholds.detach().cpu()
+                        if hasattr(criterion, 'dynamic_threshold') else None
+                    ),
                     'best_score': best_score,
                     'best_conf_kept': conf_kept_for_score,
                     'best_vis_stability': vis_stability,
@@ -1130,6 +1142,10 @@ def main(args):
                 }
             except Exception:
                 rng_state = None
+            dyn_thr_tensor_cpu = (
+                criterion.dynamic_threshold.thresholds.detach().cpu()
+                if hasattr(criterion, 'dynamic_threshold') else None
+            )
             for checkpoint_path in checkpoint_paths:
                 utils.save_on_master({
                     'uda_run': True,
@@ -1140,6 +1156,7 @@ def main(args):
                     'epoch': epoch,
                     'args': args,
                     'pseudo_target_thr_ema': float(getattr(criterion, 'pseudo_target_thr_ema', float('nan'))),
+                    'dynamic_threshold_thresholds': dyn_thr_tensor_cpu,
                     'best_score': best_score if best_score != -float('inf') else None,
                     'source_baseline_ap': source_baseline_ap,
                     'last_source_ap': last_source_ap,
