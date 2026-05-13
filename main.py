@@ -720,10 +720,19 @@ def main(args):
                     print(f"  ⚠️ RNG 恢复失败（忽略）: {e}")
         else:
             print(f"🆕 [Pretrain Init] 外部预训练权重（无 teacher_model 字段），按从头训练加载，start_epoch=0")
-            # 丢弃可能不匹配的分类头
-            keys_to_remove = [k for k in state_dict.keys() if k.startswith("class_embed")]
-            for k in keys_to_remove:
-                del state_dict[k]
+            # 只在 shape 不匹配时丢弃 class_embed（num_classes 一致时保留已训练的分类头）
+            model_sd = model_without_ddp.state_dict()
+            keys_to_remove = []
+            for k in list(state_dict.keys()):
+                if k.startswith("class_embed") and k in model_sd:
+                    if state_dict[k].shape != model_sd[k].shape:
+                        keys_to_remove.append(k)
+            if keys_to_remove:
+                print(f"  ⚠️ class_embed shape 不匹配，丢弃 {len(keys_to_remove)} 个 key（将从头训练分类头）")
+                for k in keys_to_remove:
+                    del state_dict[k]
+            else:
+                print(f"  ✓ class_embed shape 匹配，保留已训练的分类头")
             missing_keys, unexpected_keys = model_without_ddp.load_state_dict(state_dict, strict=False)
             print(f"  Student Load - Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
             # Teacher 与 Student 对齐
