@@ -90,15 +90,16 @@ def get_args_parser():
     parser.add_argument('--pseudo_corner_thresh', default=0.45, type=float, help="教师伪标签角点分数阈值")
     parser.add_argument('--pseudo_corner_nms_thresh', default=10.0, type=float, help="教师伪标签角点NMS距离阈值（像素）")
     parser.add_argument('--disable_pseudo_corner_nms', action='store_true', help="构建教师伪标签时禁用角点NMS")
-    parser.add_argument('--pseudo_thr_init', default=0.34, type=float, help="自适应伪标签阈值EMA初始值")
-    parser.add_argument('--pseudo_thr_min', default=0.35, type=float, help="自适应伪标签阈值最小值")
-    parser.add_argument('--pseudo_thr_max', default=0.60, type=float, help="自适应伪标签阈值最大值")
+    parser.add_argument('--pseudo_thr_init', default=0.45, type=float, help="自适应伪标签阈值EMA初始值")
+    parser.add_argument('--pseudo_thr_min', default=0.45, type=float, help="自适应伪标签阈值最小值")
+    parser.add_argument('--pseudo_thr_max', default=0.65, type=float, help="自适应伪标签阈值最大值")
     parser.add_argument('--pseudo_thr_quantile', default=0.94, type=float, help="目标域置信度分位数，用于估计目标阈值")
     parser.add_argument('--pseudo_thr_target_ema_momentum', default=0.95, type=float, help="目标域分位数阈值EMA动量")
     parser.add_argument('--pseudo_thr_source_weight', default=0.20, type=float, help="融合阈值中source动态阈值权重")
     parser.add_argument('--pseudo_thr_target_weight', default=0.80, type=float, help="融合阈值中target分位数EMA权重")
     parser.add_argument('--pseudo_topk', default=25, type=int, help="每张图最多保留的伪标签数量")
     parser.add_argument('--pseudo_min_box_area', default=0.004, type=float, help="伪标签最小框面积（归一化wh面积）")
+    parser.add_argument('--pseudo_max_box_area', default=0.20, type=float, help="伪标签最大框面积上限（归一化wh面积），过滤把整片绿地/广场打包成一个建筑的误检")
     parser.add_argument('--disable_pseudo_polygon_nms', action='store_true', help="构建教师伪标签时禁用多边形NMS")
     parser.add_argument('--pseudo_polygon_nms_iou', default=0.30, type=float, help="教师伪标签多边形NMS的IoU阈值")
     parser.add_argument('--pseudo_polygon_nms_downsample', default=4, type=int, help="多边形IoU栅格化降采样倍率")
@@ -771,6 +772,7 @@ def main(args):
             "pseudo_thr_target_weight": args.pseudo_thr_target_weight,
             "pseudo_topk": args.pseudo_topk,
             "pseudo_min_box_area": args.pseudo_min_box_area,
+            "pseudo_max_box_area": args.pseudo_max_box_area,
         }
         with run_meta_path.open("w", encoding="utf-8") as f:
             f.write(f"run_start_time: {datetime.datetime.now().isoformat()}\n")

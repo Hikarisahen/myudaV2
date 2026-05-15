@@ -35,11 +35,11 @@ class DynamicThreshold:
     Threshold = gamma * Old + (1-gamma) * a * (Mean_Source_Conf)^b
     
     """
-    def __init__(self, num_classes, 
-                 min_threshold=0.18, # 放宽下限，让早期目标域不过度空缺
-                 initial_threshold=0.28, # 更低初始值，便于起步
-                 max_threshold=0.45, # 论文上限 
-                 gamma=0.95, 
+    def __init__(self, num_classes,
+                 min_threshold=0.30, # 抬高下限，剥离低置信FP（树冠/操场/水面）
+                 initial_threshold=0.35, # 起步即收紧，避免早期伪标签噪声反复确认
+                 max_threshold=0.55, # 允许后期严格化
+                 gamma=0.95,
                  a=0.8, # 论文参数 a [cite: 508]
                  b=1.0  # 论文参数 b [cite: 508]
                  ):
@@ -415,7 +415,7 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
 
         # 2. FDA Style Transfer (Source -> Target Style)
         # 即使在 burn-in 阶段也做 FDA，让 Student 适应 Target 风格
-        src_imgs_stylized = FDA_source_to_target(src_imgs, tgt_imgs, beta=0.05)
+        src_imgs_stylized = FDA_source_to_target(src_imgs, tgt_imgs, beta=0.01)
         src_samples_stylized = utils.NestedTensor(src_imgs_stylized, src_samples.mask)
 
         # 3. Teacher Generate Pseudo Labels
@@ -426,6 +426,7 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
             corner_nms_thresh = getattr(args, 'pseudo_corner_nms_thresh', 10.0)
             enable_corner_nms = not getattr(args, 'disable_pseudo_corner_nms', False)
             pseudo_min_box_area = getattr(args, 'pseudo_min_box_area', 0.004)
+            pseudo_max_box_area = getattr(args, 'pseudo_max_box_area', 0.20)
             pseudo_topk = getattr(args, 'pseudo_topk', 25)
             enable_polygon_nms = not getattr(args, 'disable_pseudo_polygon_nms', False)
             pseudo_polygon_nms_iou = float(getattr(args, 'pseudo_polygon_nms_iou', 0.3))
@@ -515,9 +516,13 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
                         })
                         continue
 
-                    # 3.2.1 [新增] 过滤过小伪框，抑制目标域小伪影
+                    # 3.2.1 [新增] 过滤过小/过大伪框：
+                    #   - 过小：抑制目标域小伪影
+                    #   - 过大：把整片绿地/操场/水面打包成"一个建筑"的典型误检
                     box_area = sel_boxes[:, 2].clamp(min=0) * sel_boxes[:, 3].clamp(min=0)
-                    keep_area = torch.where(box_area >= pseudo_min_box_area)[0]
+                    keep_area = torch.where(
+                        (box_area >= pseudo_min_box_area) & (box_area <= pseudo_max_box_area)
+                    )[0]
 
                     if keep_area.shape[0] == 0:
                         pseudo_targets.append({
