@@ -90,8 +90,8 @@ def get_args_parser():
     parser.add_argument('--pseudo_corner_thresh', default=0.45, type=float, help="教师伪标签角点分数阈值")
     parser.add_argument('--pseudo_corner_nms_thresh', default=10.0, type=float, help="教师伪标签角点NMS距离阈值（像素）")
     parser.add_argument('--disable_pseudo_corner_nms', action='store_true', help="构建教师伪标签时禁用角点NMS")
-    parser.add_argument('--pseudo_thr_init', default=0.45, type=float, help="自适应伪标签阈值EMA初始值")
-    parser.add_argument('--pseudo_thr_min', default=0.45, type=float, help="自适应伪标签阈值最小值")
+    parser.add_argument('--pseudo_thr_init', default=0.40, type=float, help="自适应伪标签阈值EMA初始值")
+    parser.add_argument('--pseudo_thr_min', default=0.35, type=float, help="自适应伪标签阈值最小值（v6 过严漏检 / v1 过松误检之间的折中）")
     parser.add_argument('--pseudo_thr_max', default=0.65, type=float, help="自适应伪标签阈值最大值")
     parser.add_argument('--pseudo_thr_quantile', default=0.94, type=float, help="目标域置信度分位数，用于估计目标阈值")
     parser.add_argument('--pseudo_thr_target_ema_momentum', default=0.95, type=float, help="目标域分位数阈值EMA动量")
@@ -1079,8 +1079,11 @@ def main(args):
             gate_g2 = True
             gate_g2_reason = "no_pseudo_count_or_no_baseline"
         else:
-            g2_low = 0.3 * source_avg_buildings_per_image
-            g2_high = 2.0 * source_avg_buildings_per_image
+            # 跨域密度差异大（CrowdAI 郊区 vs Wuhan dense urban），范围放宽：
+            #  下限 0.1×：允许严格阈值下伪标签暂时较少（避免 v6 那种早期 G2 全挂）
+            #  上限 4.0×：允许目标域天然密度高（避免 v1 那种 dense urban 触顶）
+            g2_low = 0.1 * source_avg_buildings_per_image
+            g2_high = 4.0 * source_avg_buildings_per_image
             gate_g2 = g2_low <= epoch_n_pseudo <= g2_high
             gate_g2_reason = f"n_pseudo={epoch_n_pseudo:.3f}, range=[{g2_low:.3f}, {g2_high:.3f}]"
         # 复合分
