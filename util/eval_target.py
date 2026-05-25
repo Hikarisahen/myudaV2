@@ -101,6 +101,10 @@ def main():
     parser.add_argument("--num_workers_eval", type=int, default=2)
     parser.add_argument("--save_stats", type=str, default=None,
                         help="可选：将 AP 指标存为 JSON 的路径")
+    parser.add_argument("--use_teacher", action="store_true",
+                        help="加载 checkpoint['teacher_model']（默认）；与训练时 best 选择口径一致。")
+    parser.add_argument("--use_student", action="store_true",
+                        help="强制加载 checkpoint['model']（student）。仅用于对比 student/teacher 差异。")
 
     args = parser.parse_args()
     args.device = torch.device(args.device)
@@ -109,7 +113,20 @@ def main():
     from models import build_model
     model, _criterion, postprocessors = build_model(args)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    state_dict = checkpoint["model"]
+
+    # 默认加载 teacher（与训练时 best 选择口径一致）。
+    # 若 ckpt 没有 teacher 或显式指定 --use_student，则回退到 student。
+    if args.use_student:
+        which = 'student (forced by --use_student)'
+        state_dict = checkpoint["model"]
+    elif 'teacher_model' in checkpoint:
+        which = 'teacher_model'
+        state_dict = checkpoint["teacher_model"]
+    else:
+        which = 'student (no teacher_model in ckpt)'
+        state_dict = checkpoint["model"]
+    print(f"[eval_target] Loading weights from: {which}")
+
     model_state_dict = model.state_dict()
     drop = [k for k, v in state_dict.items()
             if k in model_state_dict and v.shape != model_state_dict[k].shape]
@@ -118,9 +135,9 @@ def main():
         del state_dict[k]
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
-        print(f"Missing keys: {missing}")
+        print(f"Missing keys: {len(missing)}")
     if unexpected:
-        print(f"Unexpected keys: {unexpected}")
+        print(f"Unexpected keys: {len(unexpected)}")
     model.to(args.device)
     model.eval()
 
