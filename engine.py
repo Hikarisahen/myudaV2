@@ -387,6 +387,29 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
     if not hasattr(criterion, 'pseudo_target_thr_ema'):
         init_thr = float(getattr(args, 'pseudo_thr_init', 0.34))
         criterion.pseudo_target_thr_ema = min(thr_max, max(thr_min, init_thr))
+
+    # ===== FreeMatch-style 阈值方案 =====
+    # 设计依据：旧 legacy 分位数在全 query 上算(300 query × ~3% 前景),被背景稀释,
+    # 长期被 thr_min 救场,失去自适应能力。FreeMatch 做法是只跟踪"前景候选"的 μ/σ。
+    thr_method = str(getattr(args, 'pseudo_thr_method', 'legacy')).lower()
+    fm_enabled = (thr_method == 'freematch')
+    if fm_enabled:
+        fm_topk_mult = float(getattr(args, 'pseudo_thr_fm_topk_mult', 1.5))
+        fm_k_sigma = float(getattr(args, 'pseudo_thr_fm_k_sigma', 1.0))
+        fm_ema_m = float(getattr(args, 'pseudo_thr_fm_ema_momentum', 0.99))
+        fm_ema_m = min(0.9999, max(0.0, fm_ema_m))
+        fm_warmup = int(getattr(args, 'pseudo_thr_fm_warmup_epochs', 10))
+        fm_floor = float(getattr(args, 'pseudo_thr_fm_floor', 0.40))
+        fm_ceil = float(getattr(args, 'pseudo_thr_fm_ceil', 0.75))
+        if fm_ceil < fm_floor:
+            fm_ceil = fm_floor
+        fm_src_check = float(getattr(args, 'pseudo_thr_fm_source_check', 0.30))
+        src_avg_obj = float(getattr(args, 'source_avg_objects', 8.0))
+        fm_K = max(5, int(math.ceil(fm_topk_mult * max(1.0, src_avg_obj))))
+        fm_init = float(getattr(args, 'pseudo_thr_init', 0.35))
+        if not hasattr(criterion, 'conf_mu_ema'):
+            criterion.conf_mu_ema = float(fm_init)
+            criterion.conf_sigma_ema = 0.10
     
     # === [MRT Strategy] Burn-in Period ===
     # 前若干 epoch 只做 Source + MAE，完全忽略 Teacher 伪标签
@@ -451,17 +474,61 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
                 pseudo_conf_sum += top_scores.sum().item()
                 pseudo_conf_count += top_scores.numel()
 
-                if top_scores.numel() > 0:
-                    q_thr = torch.quantile(top_scores.reshape(-1), thr_quantile).item()
-                else:
-                    q_thr = criterion.pseudo_target_thr_ema
-                target_ema = thr_ema_momentum * criterion.pseudo_target_thr_ema + (1.0 - thr_ema_momentum) * q_thr
-                target_ema = min(thr_max, max(thr_min, target_ema))
-                criterion.pseudo_target_thr_ema = target_ema
-
                 raw_thr = float(criterion.dynamic_threshold.get_threshold(0))
-                fused_thr = source_w * raw_thr + target_w * target_ema
-                effective_thr = min(thr_max, max(thr_min, fused_thr))
+
+                if fm_enabled:
+                    # ---- FreeMatch-style: μ-kσ 跟踪前景候选置信度 ----
+                    # 1) 每图取 top-K(K = ceil(mult * source_avg))作为前景候选,排除背景稀释
+                    if top_scores.numel() > 0:
+                        K_eff = min(fm_K, top_scores.shape[-1])
+                        topK, _ = top_scores.topk(K_eff, dim=-1)  # [B, K]
+                        batch_mean = topK.mean().item()
+                        # 单图样本太少时 std 不稳,跨 batch 计算
+                        batch_std = topK.reshape(-1).std(unbiased=False).item() if topK.numel() > 1 else 0.0
+                    else:
+                        batch_mean = criterion.conf_mu_ema
+                        batch_std = criterion.conf_sigma_ema
+
+                    # 2) per-iter EMA 更新前景分布参数
+                    criterion.conf_mu_ema = fm_ema_m * criterion.conf_mu_ema + (1.0 - fm_ema_m) * batch_mean
+                    criterion.conf_sigma_ema = fm_ema_m * criterion.conf_sigma_ema + (1.0 - fm_ema_m) * batch_std
+
+                    # 3) τ = μ - k·σ (高斯近似下接受置信度排名前 ~84% 的前景)
+                    tau_raw = criterion.conf_mu_ema - fm_k_sigma * criterion.conf_sigma_ema
+
+                    # 4) Warmup: burn-in 后线性 ramp-up,避免阈值突变冲击伪标签集
+                    burn_in_end = int(getattr(args, 'burn_in_epochs', 5))
+                    if fm_warmup > 0 and epoch < burn_in_end + fm_warmup:
+                        progress = max(0.0, (epoch - burn_in_end + 1)) / float(fm_warmup)
+                        progress = min(1.0, max(0.0, progress))
+                        tau = (1.0 - progress) * fm_init + progress * tau_raw
+                    else:
+                        tau = tau_raw
+
+                    # 5) Sanity check:τ 与源域阈值差距过大说明 domain gap 还很大,
+                    #    保守地与 raw_thr 等权融合,防 collapse
+                    if fm_src_check > 0 and abs(tau - raw_thr) > fm_src_check:
+                        tau = 0.5 * tau + 0.5 * raw_thr
+
+                    # 6) 硬截断
+                    effective_thr = min(fm_ceil, max(fm_floor, tau))
+
+                    # 复用旧日志字段:target_ema 存 μ_ema, q_thr 存 σ_ema,语义可读
+                    target_ema = criterion.conf_mu_ema
+                    q_thr = criterion.conf_sigma_ema
+                    criterion.pseudo_target_thr_ema = effective_thr  # 重训事件触发逻辑仍读这个
+                else:
+                    # ---- Legacy: 分位数 + EMA + source/target 加权融合 ----
+                    if top_scores.numel() > 0:
+                        q_thr = torch.quantile(top_scores.reshape(-1), thr_quantile).item()
+                    else:
+                        q_thr = criterion.pseudo_target_thr_ema
+                    target_ema = thr_ema_momentum * criterion.pseudo_target_thr_ema + (1.0 - thr_ema_momentum) * q_thr
+                    target_ema = min(thr_max, max(thr_min, target_ema))
+                    criterion.pseudo_target_thr_ema = target_ema
+
+                    fused_thr = source_w * raw_thr + target_w * target_ema
+                    effective_thr = min(thr_max, max(thr_min, fused_thr))
 
                 for i in range(len(top_scores)):
                     thr = effective_thr

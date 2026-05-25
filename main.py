@@ -97,6 +97,23 @@ def get_args_parser():
     parser.add_argument('--pseudo_thr_target_ema_momentum', default=0.95, type=float, help="目标域分位数阈值EMA动量")
     parser.add_argument('--pseudo_thr_source_weight', default=0.20, type=float, help="融合阈值中source动态阈值权重")
     parser.add_argument('--pseudo_thr_target_weight', default=0.80, type=float, help="融合阈值中target分位数EMA权重")
+    # ===== FreeMatch-style 阈值方案 (可选, 解决全 query 分位数被背景稀释的问题) =====
+    parser.add_argument('--pseudo_thr_method', default='legacy', choices=['legacy', 'freematch'],
+                        help="阈值方案：legacy=旧的分位数+EMA融合；freematch=基于前景候选 μ-kσ 跟踪")
+    parser.add_argument('--pseudo_thr_fm_topk_mult', default=1.5, type=float,
+                        help="[freematch] 每图取 top-K 前景候选，K = ceil(mult * source_avg_objects)")
+    parser.add_argument('--pseudo_thr_fm_k_sigma', default=1.0, type=float,
+                        help="[freematch] τ = μ_ema - k * σ_ema 中的 k，1.0 对应接受置信度排名前 ~84%% 的前景")
+    parser.add_argument('--pseudo_thr_fm_ema_momentum', default=0.99, type=float,
+                        help="[freematch] per-iter EMA 动量，越大越平滑")
+    parser.add_argument('--pseudo_thr_fm_warmup_epochs', default=10, type=int,
+                        help="[freematch] burn-in 结束后线性 ramp-up 的 epoch 数，期间从 init 平滑过渡到 μ-kσ")
+    parser.add_argument('--pseudo_thr_fm_floor', default=0.40, type=float,
+                        help="[freematch] 阈值下限，抬高以剥离低置信 FP")
+    parser.add_argument('--pseudo_thr_fm_ceil', default=0.75, type=float,
+                        help="[freematch] 阈值上限，防止后期 σ 收缩导致阈值过高把伪标签干掉")
+    parser.add_argument('--pseudo_thr_fm_source_check', default=0.3, type=float,
+                        help="[freematch] 若 |τ - raw_thr| 超过该值，则与 raw_thr 等权融合（防 collapse）；<=0 关闭")
     parser.add_argument('--pseudo_topk', default=25, type=int, help="每张图最多保留的伪标签数量")
     parser.add_argument('--pseudo_min_box_area', default=0.004, type=float, help="伪标签最小框面积（归一化wh面积）")
     parser.add_argument('--pseudo_max_box_area', default=0.20, type=float, help="伪标签最大框面积上限（归一化wh面积），过滤把整片绿地/广场打包成一个建筑的误检")
@@ -567,6 +584,7 @@ def main(args):
     # === [新增] 源域 baseline 统计 + 固定 val 子集（500 张）===
     source_avg_buildings_per_image = compute_source_baseline_count(dataset_source_train)
     print(f"[SourceBaseline] avg buildings per image: {source_avg_buildings_per_image:.3f}")
+    args.source_avg_objects = float(source_avg_buildings_per_image)
 
     val_subset_indices = load_or_create_val_subset(args.source_path, dataset_val, n_subset=500, seed=42)
     dataset_val_subset = Subset(dataset_val, val_subset_indices)
@@ -770,6 +788,14 @@ def main(args):
             "pseudo_thr_target_ema_momentum": args.pseudo_thr_target_ema_momentum,
             "pseudo_thr_source_weight": args.pseudo_thr_source_weight,
             "pseudo_thr_target_weight": args.pseudo_thr_target_weight,
+            "pseudo_thr_method": args.pseudo_thr_method,
+            "pseudo_thr_fm_topk_mult": args.pseudo_thr_fm_topk_mult,
+            "pseudo_thr_fm_k_sigma": args.pseudo_thr_fm_k_sigma,
+            "pseudo_thr_fm_ema_momentum": args.pseudo_thr_fm_ema_momentum,
+            "pseudo_thr_fm_warmup_epochs": args.pseudo_thr_fm_warmup_epochs,
+            "pseudo_thr_fm_floor": args.pseudo_thr_fm_floor,
+            "pseudo_thr_fm_ceil": args.pseudo_thr_fm_ceil,
+            "pseudo_thr_fm_source_check": args.pseudo_thr_fm_source_check,
             "pseudo_topk": args.pseudo_topk,
             "pseudo_min_box_area": args.pseudo_min_box_area,
             "pseudo_max_box_area": args.pseudo_max_box_area,
