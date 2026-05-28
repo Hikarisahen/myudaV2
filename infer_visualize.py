@@ -19,9 +19,21 @@ python infer_visualize.py   --checkpoint weight/checkpoint_crowd.pth   --image_d
 def load_model(args, checkpoint_path):
     model, criterion, postprocessors = build_model(args)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    
+
+    # 默认加载 teacher（与 eval_target.py / 训练 best 选择口径一致）。
+    # 若 ckpt 没有 teacher 或显式指定 --use_student，则回退到 student。
+    if getattr(args, 'use_student', False):
+        which = 'student (forced by --use_student)'
+        state_dict = checkpoint['model']
+    elif 'teacher_model' in checkpoint:
+        which = 'teacher_model'
+        state_dict = checkpoint['teacher_model']
+    else:
+        which = 'student (no teacher_model in ckpt)'
+        state_dict = checkpoint['model']
+    print(f"[infer_visualize] Loading weights from: {which}")
+
     # [Fix] 自动过滤形状不匹配的权重 (如 class_embed)
-    state_dict = checkpoint['model']
     model_state_dict = model.state_dict()
     keys_to_remove = []
     for k, v in state_dict.items():
@@ -34,9 +46,9 @@ def load_model(args, checkpoint_path):
 
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     if missing_keys:
-        print(f"Warning: missing keys when loading checkpoint: {missing_keys}")
+        print(f"Warning: missing keys when loading checkpoint: {len(missing_keys)}")
     if unexpected_keys:
-        print(f"Warning: unexpected keys when loading checkpoint: {unexpected_keys}")
+        print(f"Warning: unexpected keys when loading checkpoint: {len(unexpected_keys)}")
     model.to(args.device)
     model.eval()
     return model
@@ -359,6 +371,10 @@ def main():
     parser.add_argument("--polygon_nms_iou", type=float, default=0.3, help="Polygon NMS IoU threshold")
     parser.add_argument("--polygon_nms_downsample", type=int, default=4, help="Downsample factor for polygon IoU rasterization")
     parser.add_argument("--disable_self_intersection_repair", action="store_true", help="Disable polygon self-intersection repair")
+    parser.add_argument("--use_teacher", action="store_true",
+                        help="加载 checkpoint['teacher_model']（默认）；与 eval_target.py / 训练 best 选择口径一致。")
+    parser.add_argument("--use_student", action="store_true",
+                        help="强制加载 checkpoint['model']（student）。仅用于对比 student/teacher 差异。")
 
 
     args = parser.parse_args()
