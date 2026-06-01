@@ -114,6 +114,10 @@ def get_args_parser():
                         help="[freematch] 阈值上限，防止后期 σ 收缩导致阈值过高把伪标签干掉")
     parser.add_argument('--pseudo_thr_fm_source_check', default=0.3, type=float,
                         help="[freematch] 若 |τ - raw_thr| 超过该值，则与 raw_thr 等权融合（防 collapse）；<=0 关闭")
+    parser.add_argument('--pseudo_thr_fm_sigma_source', default='kept', choices=['kept', 'topk'],
+                        help="[freematch] μ/σ 估计样本来源：kept=仅在通过上一iter阈值的样本上估计（推荐，σ 会显著收缩使自适应机制真正生效）；topk=旧行为，在每图 top-K 上估计")
+    parser.add_argument('--pseudo_thr_fm_min_kept', default=8, type=int,
+                        help="[freematch] kept 模式下的最小样本数门限，低于此则该 iter 回退到 top-K 估计（防 σ 在小样本下不稳）")
     parser.add_argument('--pseudo_topk', default=25, type=int, help="每张图最多保留的伪标签数量")
     parser.add_argument('--pseudo_min_box_area', default=0.004, type=float, help="伪标签最小框面积（归一化wh面积）")
     parser.add_argument('--pseudo_max_box_area', default=0.20, type=float, help="伪标签最大框面积上限（归一化wh面积），过滤把整片绿地/广场打包成一个建筑的误检")
@@ -796,6 +800,8 @@ def main(args):
             "pseudo_thr_fm_floor": args.pseudo_thr_fm_floor,
             "pseudo_thr_fm_ceil": args.pseudo_thr_fm_ceil,
             "pseudo_thr_fm_source_check": args.pseudo_thr_fm_source_check,
+            "pseudo_thr_fm_sigma_source": args.pseudo_thr_fm_sigma_source,
+            "pseudo_thr_fm_min_kept": args.pseudo_thr_fm_min_kept,
             "pseudo_topk": args.pseudo_topk,
             "pseudo_min_box_area": args.pseudo_min_box_area,
             "pseudo_max_box_area": args.pseudo_max_box_area,

@@ -407,9 +407,14 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
         src_avg_obj = float(getattr(args, 'source_avg_objects', 8.0))
         fm_K = max(5, int(math.ceil(fm_topk_mult * max(1.0, src_avg_obj))))
         fm_init = float(getattr(args, 'pseudo_thr_init', 0.35))
+        fm_sigma_src = str(getattr(args, 'pseudo_thr_fm_sigma_source', 'kept')).lower()
+        fm_min_kept = int(getattr(args, 'pseudo_thr_fm_min_kept', 8))
         if not hasattr(criterion, 'conf_mu_ema'):
             criterion.conf_mu_ema = float(fm_init)
             criterion.conf_sigma_ema = 0.10
+        # 诊断计数:本 epoch 内有多少 iter 用 kept 估计、多少 fallback 到 topK
+        criterion._fm_iter_kept = 0
+        criterion._fm_iter_topk = 0
     
     # === [MRT Strategy] Burn-in Period ===
     # 前若干 epoch 只做 Source + MAE，完全忽略 Teacher 伪标签
@@ -478,13 +483,36 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
 
                 if fm_enabled:
                     # ---- FreeMatch-style: μ-kσ 跟踪前景候选置信度 ----
-                    # 1) 每图取 top-K(K = ceil(mult * source_avg))作为前景候选,排除背景稀释
+                    # 1) μ/σ 估计样本来源:
+                    #    kept 模式(默认):用上一 iter 的 τ 过滤,只在"被接受过的样本"上估计。
+                    #                     σ 会从 ~0.30 收缩到 ~0.05,使 μ-kσ 真正能超过 floor,
+                    #                     从而让自适应机制接管,floor 退居安全网。
+                    #    topk 模式(回退):旧行为,在每图 top-K 上估计(K 内混背景,σ 偏大)。
                     if top_scores.numel() > 0:
                         K_eff = min(fm_K, top_scores.shape[-1])
                         topK, _ = top_scores.topk(K_eff, dim=-1)  # [B, K]
-                        batch_mean = topK.mean().item()
-                        # 单图样本太少时 std 不稳,跨 batch 计算
-                        batch_std = topK.reshape(-1).std(unbiased=False).item() if topK.numel() > 1 else 0.0
+                        topK_flat = topK.reshape(-1)
+
+                        used_kept = False
+                        if fm_sigma_src == 'kept':
+                            prev_tau = float(criterion.pseudo_target_thr_ema)
+                            kept_mask = topK_flat >= prev_tau
+                            n_kept = int(kept_mask.sum().item())
+                            if n_kept >= fm_min_kept:
+                                kept = topK_flat[kept_mask]
+                                batch_mean = kept.mean().item()
+                                batch_std = kept.std(unbiased=False).item() if kept.numel() > 1 else 0.0
+                                used_kept = True
+
+                        if not used_kept:
+                            # kept 样本不足 → 退回 top-K(早期 warmup / 模型还很弱时的兜底)
+                            batch_mean = topK_flat.mean().item()
+                            batch_std = topK_flat.std(unbiased=False).item() if topK_flat.numel() > 1 else 0.0
+
+                        if used_kept:
+                            criterion._fm_iter_kept += 1
+                        else:
+                            criterion._fm_iter_topk += 1
                     else:
                         batch_mean = criterion.conf_mu_ema
                         batch_std = criterion.conf_sigma_ema
