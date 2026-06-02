@@ -407,10 +407,22 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
         src_avg_obj = float(getattr(args, 'source_avg_objects', 8.0))
         fm_K = max(5, int(math.ceil(fm_topk_mult * max(1.0, src_avg_obj))))
         fm_init = float(getattr(args, 'pseudo_thr_init', 0.35))
+        # ===== [新增] μ/σ 估计来源 =====
+        # topk(=V10 旧行为)：每图 top-K 上估 μ/σ，K 内混背景 → σ 偏大 → τ=μ-kσ 常为负
+        #                    → effective 被 fm_floor 钉死，自适应失效（实测 V10 全程 effective≡0.45）。
+        # fg_gate(修复)：只在"绝对门限 fm_fg_gate 以上的前景候选"上估 μ/σ，剔除背景污染，
+        #                σ 收缩到合理范围，τ 落在 0.3~0.6 且随 teacher 变强而移动；
+        #                门限固定(不随 τ) → 避免 kept 模式那种正反馈把阈值顶高。
+        fm_estimator = str(getattr(args, 'pseudo_thr_fm_estimator', 'topk')).lower()
+        fm_fg_gate = float(getattr(args, 'pseudo_thr_fm_fg_gate', 0.25))
+        fm_min_fg = int(getattr(args, 'pseudo_thr_fm_min_fg', 8))
         if not hasattr(criterion, 'conf_mu_ema'):
             criterion.conf_mu_ema = float(fm_init)
             criterion.conf_sigma_ema = 0.10
-    
+        # 诊断计数：本 epoch 内有多少 iter 用 fg_gate 估计、多少 fallback 到 top-K
+        criterion._fm_iter_fg = 0
+        criterion._fm_iter_topk = 0
+
     # === [MRT Strategy] Burn-in Period ===
     # 前若干 epoch 只做 Source + MAE，完全忽略 Teacher 伪标签
     burn_in_epochs = getattr(args, 'burn_in_epochs', 5)
@@ -478,13 +490,27 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
 
                 if fm_enabled:
                     # ---- FreeMatch-style: μ-kσ 跟踪前景候选置信度 ----
-                    # 1) 每图取 top-K(K = ceil(mult * source_avg))作为前景候选,排除背景稀释
+                    # 1) μ/σ 估计样本来源（见上方 fm_estimator 注释）
                     if top_scores.numel() > 0:
-                        K_eff = min(fm_K, top_scores.shape[-1])
-                        topK, _ = top_scores.topk(K_eff, dim=-1)  # [B, K]
-                        batch_mean = topK.mean().item()
-                        # 单图样本太少时 std 不稳,跨 batch 计算
-                        batch_std = topK.reshape(-1).std(unbiased=False).item() if topK.numel() > 1 else 0.0
+                        used_fg = False
+                        if fm_estimator == 'fg_gate':
+                            # 只在"绝对门限以上的前景候选"上估 μ/σ，剔除背景污染
+                            scores_flat = top_scores.reshape(-1)
+                            fg = scores_flat[scores_flat > fm_fg_gate]
+                            if fg.numel() >= fm_min_fg:
+                                batch_mean = fg.mean().item()
+                                batch_std = fg.std(unbiased=False).item() if fg.numel() > 1 else 0.0
+                                used_fg = True
+                                criterion._fm_iter_fg += 1
+
+                        if not used_fg:
+                            # 回退：topk 模式 / 前景候选不足（早期或 teacher 太弱）→ 每图 top-K 兜底
+                            K_eff = min(fm_K, top_scores.shape[-1])
+                            topK, _ = top_scores.topk(K_eff, dim=-1)  # [B, K]
+                            batch_mean = topK.mean().item()
+                            # 单图样本太少时 std 不稳,跨 batch 计算
+                            batch_std = topK.reshape(-1).std(unbiased=False).item() if topK.numel() > 1 else 0.0
+                            criterion._fm_iter_topk += 1
                     else:
                         batch_mean = criterion.conf_mu_ema
                         batch_std = criterion.conf_sigma_ema
@@ -774,6 +800,15 @@ def train_one_epoch(student: torch.nn.Module, teacher: torch.nn.Module,
     stats['pseudo_thr_target_ema_mean'] = (pseudo_thr_target_ema_sum / pseudo_thr_count) if pseudo_thr_count > 0 else float('nan')
     stats['pseudo_thr_quantile_mean'] = (pseudo_thr_quantile_sum / pseudo_thr_count) if pseudo_thr_count > 0 else float('nan')
     stats['pseudo_count_per_img'] = (pseudo_count_total / pseudo_count_imgs) if pseudo_count_imgs > 0 else float('nan')
+    # [诊断] freematch 估计器使用情况：fg_gate 命中多 = 修复生效；几乎全是 topk = 前景候选不足在兜底
+    if getattr(criterion, '_fm_iter_fg', None) is not None or getattr(criterion, '_fm_iter_topk', None) is not None:
+        n_fg = int(getattr(criterion, '_fm_iter_fg', 0))
+        n_tk = int(getattr(criterion, '_fm_iter_topk', 0))
+        print(f"[FM-Estimator][Epoch {epoch}] fg_gate_iters={n_fg}, topk_fallback_iters={n_tk}, "
+              f"mu_ema={getattr(criterion, 'conf_mu_ema', float('nan')):.4f}, "
+              f"sigma_ema={getattr(criterion, 'conf_sigma_ema', float('nan')):.4f}")
+        stats['fm_iter_fg'] = n_fg
+        stats['fm_iter_topk'] = n_tk
     return stats
 
 @torch.no_grad()

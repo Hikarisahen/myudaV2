@@ -16,7 +16,11 @@
       "Bash(python -m py_compile engine.py main.py)",
       "Bash(python -m py_compile engine.py)",
       "Bash(python -m py_compile main.py)",
-      "Bash(python -m py_compile infer_visualize.py)"
+      "Bash(python -m py_compile infer_visualize.py)",
+      "PowerShell(python -m py_compile engine.py; Write-Output \"engine exit=$LASTEXITCODE\"; python -m py_compile main.py; Write-Output \"main exit=$LASTEXITCODE\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\22515\\.claude\\projects\\c--Users-22515-Desktop-myproject-myudaV2\\memory"
     ]
   }
 }
