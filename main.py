@@ -161,6 +161,13 @@ def get_args_parser():
                         help="事件触发阈值：effective_threshold 单轮下降超过该值时触发")
     parser.add_argument('--retrain_cooldown_epochs', default=6, type=int,
                         help="两次重训之间的最小冷却epoch数")
+    # ----- Best 选择（精度优先 + 召回下限）-----
+    parser.add_argument('--bestsel_g2_low_mult', default=0.5, type=float,
+                        help="[best选择] G2 召回下限：n_pseudo_per_img 须 >= 该倍数×source_avg（抬高以保证 AR 不过低）")
+    parser.add_argument('--bestsel_g2_high_mult', default=1.8, type=float,
+                        help="[best选择] G2 误检上限：n_pseudo_per_img 须 <= 该倍数×source_avg（收紧以剔除 FP 膨胀的 epoch）")
+    parser.add_argument('--bestsel_conf_weight', default=0.6, type=float,
+                        help="[best选择] 复合分中 conf_kept(精度代理) 权重，(1-该值) 给 vis_stability；调高更偏精度/稳定")
     # ====================
 
     parser.add_argument('--lr', default=2e-4, type=float)
@@ -1116,17 +1123,19 @@ def main(args):
             gate_g2 = True
             gate_g2_reason = "no_pseudo_count_or_no_baseline"
         else:
-            # 跨域密度差异大（CrowdAI 郊区 vs Wuhan dense urban），范围放宽：
-            #  下限 0.1×：允许严格阈值下伪标签暂时较少（避免 v6 那种早期 G2 全挂）
-            #  上限 4.0×：允许目标域天然密度高（避免 v1 那种 dense urban 触顶）
-            g2_low = 0.1 * source_avg_buildings_per_image
-            g2_high = 4.0 * source_avg_buildings_per_image
+            # [精度优先] G2 既是召回下限也是 FP 上限：
+            #  下限 bestsel_g2_low_mult×：保证 AR 不过低（伪标签别太稀）
+            #  上限 bestsel_g2_high_mult×：剔除 FP 膨胀的 epoch（低阈值时纹理误检会把 n_pseudo 顶高）
+            g2_low = args.bestsel_g2_low_mult * source_avg_buildings_per_image
+            g2_high = args.bestsel_g2_high_mult * source_avg_buildings_per_image
             gate_g2 = g2_low <= epoch_n_pseudo <= g2_high
             gate_g2_reason = f"n_pseudo={epoch_n_pseudo:.3f}, range=[{g2_low:.3f}, {g2_high:.3f}]"
-        # 复合分
+        # 复合分（精度优先：conf_kept 权重可调，默认偏 conf_kept；G2 下限已保证 AR 不过低）
         conf_kept_for_score = epoch_pseudo_conf_kept_mean if not np.isnan(epoch_pseudo_conf_kept_mean) else 0.0
+        cw = float(getattr(args, 'bestsel_conf_weight', 0.6))
+        cw = min(1.0, max(0.0, cw))
         if not np.isnan(vis_stability):
-            composite_score = 0.5 * conf_kept_for_score + 0.5 * vis_stability
+            composite_score = cw * conf_kept_for_score + (1.0 - cw) * vis_stability
         else:
             composite_score = conf_kept_for_score if not np.isnan(epoch_pseudo_conf_kept_mean) else float('nan')
 
